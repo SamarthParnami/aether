@@ -19,9 +19,14 @@ tasks:
       - task: go:test
 
   lint:
-    desc: Lint everything (golangci-lint/eslint wired in PR-02/PR-03)
+    desc: Lint everything (Go now; eslint wired in PR-03)
     cmds:
-      - task: go:vet
+      - task: go:lint
+
+  fmt:
+    desc: Format all Go code (gofumpt + goimports)
+    cmds:
+      - task: go:fmt
 
   # --- Go ---
   go:build:
@@ -38,6 +43,23 @@ tasks:
     dir: go
     cmds:
       - go vet ./...
+
+  go:lint:
+    desc: "Run golangci-lint (install: https://golangci-lint.run/welcome/install/)"
+    dir: go
+    cmds:
+      - golangci-lint run
+
+  go:fmt:
+    dir: go
+    cmds:
+      - golangci-lint fmt
+
+  go:fmt:check:
+    desc: Fail if Go code is not formatted (CI)
+    dir: go
+    cmds:
+      - golangci-lint fmt --diff
 
   # --- Wired in later PRs ---
   # proto:gen   -> buf generate           (PR-04 / PR-06)
