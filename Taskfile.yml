@@ -9,13 +9,15 @@ tasks:
     silent: true
 
   build:
-    desc: Build everything (Go now; TS/proto wired as those PRs land)
+    desc: Build everything (generates protobuf first)
     cmds:
+      - task: proto:gen
       - task: go:build
 
   test:
-    desc: Test everything
+    desc: Test everything (generates protobuf first)
     cmds:
+      - task: proto:gen
       - task: go:test
 
   lint:

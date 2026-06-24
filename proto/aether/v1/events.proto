@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package aether.v1;
+
+option go_package = "github.com/SamarthParnami/aether/go/gen/aether/v1;aetherv1";
+
+// EventBody is the payload of a durable, ordered event. The concrete catalog
+// (SlideSet, Mute, HandRaise, AdminOverride, …) is a oneof added in PR-07; this
+// is an additive placeholder so the envelope compiles and the contract is frozen.
+message EventBody {}
+
+// EphemeralBody is the payload of a lossy, unordered broadcast (Cursor,
+// Presence, …). Populated in PR-07.
+message EphemeralBody {}
+
+// RoomState is the materialized room state carried in a Snapshot. Its fields
+// (current_slide, raised hands, mutes, …) are added with the catalog in PR-07.
+message RoomState {}
