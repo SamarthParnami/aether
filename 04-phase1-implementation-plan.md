@@ -234,9 +234,16 @@ checkpoints, *not* barriers — later PRs can start once their dependency merges
   event, at-most-one-owner.** *Done:* the failover spine is proven.
 
 ### Milestone 5 — Client SDK (TS)
+> **Note (Phase-2 React hooks):** the plan is a `packages/react` layer that exposes shared room state as
+> `useState`-like hooks — `const [slide, setSlide] = useRoomState('slide')` (setter → `commit`), plus
+> `usePresence`/`useOthers` (→ `broadcast`) and `useConnection()`. The hook internally uses local React
+> state fed by our state-sync — implemented via `useSyncExternalStore` to avoid concurrent-mode tearing +
+> the mount-gap. **Phase-1 constraint:** design the SDK state-sync to expose **`subscribe(cb)` + a snapshot
+> getter (per-key/selector)** so the hooks bridge in cleanly. Default API is the 2-tuple; `{pending, error}`
+> stays available for the async/NACK/frozen reality. Tier stays visible (durable vs ephemeral hooks).
 - **PR-20 · SDK skeleton.** `Connection` (single WS), `join`, `commit` (durable, awaits ack), `state` via the
-  TS reducer. *Tests:* SDK reducer passes golden vectors; commit→ack against a stub server. *Done:* a
-  durable write round-trips.
+  TS reducer, **`subscribe + getSnapshot` state-sync surface** (for the Phase-2 hooks). *Tests:* SDK reducer
+  passes golden vectors; commit→ack against a stub server. *Done:* a durable write round-trips.
 - **PR-21 · Recovery.** `lastSeq` cursor, `RESUME` handshake, outbound buffer + idempotent replay, optimistic
   apply + rollback on NACK. *Tests:* **fast-check property** of replay-dedup; reconnect mid-flight → no
   double-apply. *Done:* no-reload recovery works against a real gateway.
