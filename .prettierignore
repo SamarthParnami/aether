@@ -1,0 +1,13 @@
+# Hand-authored docs — not Prettier-owned
+*.md
+
+# Owned by other tooling / intentional formatting
+*.yml
+*.yaml
+go/
+gen/
+
+# Generated / vendored
+dist/
+coverage/
+.yarn/
