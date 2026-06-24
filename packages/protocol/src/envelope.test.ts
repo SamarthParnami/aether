@@ -42,4 +42,31 @@ describe('wire envelope', () => {
       expect(back.body.value.originClientSeq).toBe(42n);
     }
   });
+
+  it('round-trips the generic KeyValueSet event (Phase-1 test vehicle)', () => {
+    const msg = create(ClientMessageSchema, {
+      body: {
+        case: 'commit',
+        value: {
+          roomId: 'room-1',
+          clientSeq: 7n,
+          body: {
+            kind: { case: 'kvSet', value: { key: 'slide', value: new TextEncoder().encode('7') } },
+          },
+        },
+      },
+    });
+
+    const back = fromBinary(ClientMessageSchema, toBinary(ClientMessageSchema, msg));
+
+    expect(back.body.case).toBe('commit');
+    if (back.body.case === 'commit') {
+      const kind = back.body.value.body?.kind;
+      expect(kind?.case).toBe('kvSet');
+      if (kind?.case === 'kvSet') {
+        expect(kind.value.key).toBe('slide');
+        expect(new TextDecoder().decode(kind.value.value)).toBe('7');
+      }
+    }
+  });
 });
