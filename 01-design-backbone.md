@@ -117,33 +117,48 @@ and, on reconnect to *any* node, says "catch me up from N." Redundancy lives in 
 
 ---
 
-## 5. The monorepo & the code
+## 5. The stack & the monorepo
 
-A single monorepo (Yarn 4 workspaces + Turborepo + TS project references). The reason is structural,
-not convenience: the **shared contract is compile-time enforced across client and server in one PR**.
+**Stack (decided):** **Go** backend (`gateway` + `room-runtime`), **React + TypeScript** frontend, a
+**TypeScript SDK**, and a **Protobuf contract** between them (tooled with [Buf](https://buf.build)). It's a
+**polyglot monorepo** — Go services + a TS workspace + a language-neutral `proto/` spine. *(Build details,
+tooling, and the incremental PR plan live in [04-phase1-implementation-plan.md](04-phase1-implementation-plan.md);
+this section is the conceptual map.)*
+
+The contract being **language-neutral and machine-enforced** is the structural win: `proto/` generates
+both Go structs and TS types, and **`buf breaking` fails CI on any backward-incompatible change** — so the
+"freeze the contract" guarantee holds across two languages, in one PR.
 
 ```
-packages/
-  protocol/      # event schemas, wire envelopes, error codes + the shared reducer (event→state).
-                 #   Zero deps. Imported by BOTH client and server. THE frozen contract & spine.
-  client-sdk/    # the browser abstraction: Connection, Room, commit/broadcast, seq cursor, resume,
-                 #   optimistic apply + rollback. Hides ALL recovery machinery. → depends: protocol
-  room-core/     # pure room logic: sequencing, dedup, snapshot/replay, state machine. No I/O, no
-                 #   framework. The most-tested package. → depends: protocol
-  log-adapter/   # durable-log interface + impls (dynamo / kinesis-cdc / pg-for-dev). → depends: protocol
-  coordination/  # lease + room→owner directory interface + impls
-  test-kit/      # chaos-harness primitives: fake clients, fault injectors, convergence assertions
-apps/
-  gateway/       # stateless WS terminator. → depends: protocol, coordination
-  room-runtime/  # the owner service. → depends: room-core, log-adapter, coordination
-  web/           # Phase-2+ UI. → depends: client-sdk, protocol
-infra/           # terraform + Devtron configs, versioned atomically with the code
-e2e/             # chaos suite wiring test-kit against real gateway + room-runtime
+proto/             # Protobuf contract — THE spine. Wire envelopes + event catalog. Generates Go + TS.
+                   #   buf lint + buf breaking gate every change. Depended on by everything.
+go/                # Go module workspace (go.work)
+  internal/roomcore/   # pure room logic: fold, seq, dedup, snapshot/replay. NO I/O. Most-tested package.
+  internal/logstore/   # durable-log iface + impls (dynamo / inmem-for-tests). conditional-write guard.
+  internal/coord/      # lease + room→owner directory iface + impls. fail-safe.
+  internal/fanout/     # redis stream/pubsub + direct-push degrade
+  internal/sim/        # deterministic simulation harness (injected clock/net/rng)
+  cmd/gateway/         # stateless WS terminator
+  cmd/roomruntime/     # the owner service
+packages/          # TS workspace (Yarn 4 + Turborepo)
+  protocol/        # generated TS types + golden-vector conformance runner
+  client-sdk/      # the browser abstraction: Connection, commit/broadcast, seq cursor, resume,
+                   #   optimistic apply + rollback. Hides ALL recovery machinery.
+  react/           # (Phase 2) hooks
+apps/web/          # (Phase 2) React app
+test/chaos/        # DST scenarios + Go↔TS e2e harness
+infra/             # terraform + Devtron configs, versioned atomically with the code
 ```
 
-**Hard rules (linted):** `protocol` depends on nothing; everyone depends on it. **No server package may
-be imported by a client package** (no AWS SDK / Node built-ins in the browser bundle). The dependency
-graph points one way, at `protocol`.
+**Hard rules (linted):** everything depends on `proto/`; nothing depends "up." **The SDK / browser packages
+must not import server code** (enforced by package layout + module-boundary lint). The Go side enforces its
+own boundaries (`roomcore` has no I/O imports).
+
+**Reducer parity without a shared function.** In an all-TS design the client and server would import *one*
+reducer. Polyglot, we can't — so the shared artifact is a set of **golden test vectors**: protobuf-encoded
+`(initialState, events) → expectedState` fixtures that **both** the Go `roomcore` fold and the TS SDK
+reducer must pass in CI. That's the cross-language guard against the worst bug class in these systems
+(silent client/server state divergence).
 
 **The SDK surface** (the two tiers are visible, so misuse is impossible):
 ```ts
@@ -151,18 +166,17 @@ const room = await client.join(roomId);
 room.connectionState;                 // 'connecting'|'live'|'reconnecting'|'frozen'  — UI binds HERE
 await room.commit({ type:'SLIDE_SET', payload:{ index:7 } });  // durable: resolves on ack, rejects on NACK
 room.broadcast({ type:'CURSOR', payload:{ x,y } });            // ephemeral: fire-and-forget
-room.state;                           // materialized state, maintained by the shared reducer
+room.state;                           // materialized state, maintained by the TS reducer (golden-vector-checked)
 room.on('state', render);             // fires on every confirmed change
 ```
-The SDK **and** server share `protocol/`'s reducer — so "what an event means" cannot drift between them.
-That single shared function kills the worst bug class in these systems (silent client/server divergence).
 
 ---
 
 ## 6. Phase 1 in depth
 
-Phase 1 builds: `protocol`, `room-core`, `log-adapter`, `coordination`, `client-sdk` (durable path),
-`gateway`, `room-runtime`, `test-kit`, `e2e`. No `web`, no features, no media.
+Phase 1 builds: `proto/` (contract), Go `roomcore` / `logstore` / `coord` / `fanout` / `sim`,
+`cmd/gateway`, `cmd/roomruntime`, the TS `client-sdk` (durable path), and `test/chaos`. No `web`, no
+features, no media. *(The PR-by-PR sequence is in [04](04-phase1-implementation-plan.md) §5.)*
 
 ### 6.1 The journey of a write (durable event — e.g. teacher sets slide 7)
 
@@ -243,15 +257,17 @@ GC/jitter). Two independent guards against split-brain:
   event** → graceful `preStop` (stop writes → snapshot → **release lease** so survivors claim instantly,
   not after TTL) + long `terminationGracePeriod` + slow rollout. Gateway drains connections on SIGTERM.
   - ⚠️ **Known Devtron traps — must fix:** `minAvailable:""` silently breaks PDBs (for HA, real PDBs are
-    mandatory); `0.2Gi`→milli-bytes resource bug (use `512Mi`/`1Gi`); no `tsc`-at-startup (ship compiled
-    JS in the image — slow startup lengthens every failover).
+    mandatory); `0.2Gi`→milli-bytes resource bug (use `512Mi`/`1Gi`). *(Go services ship as a static binary,
+    so the prior TS `tsc`-at-startup OOM trap doesn't apply — but keep startup fast regardless: slow startup
+    lengthens every failover.)*
   - Beta + stable room-runtime apps with named-dispatch isolation enable dark-deploying a new owner build
     against a few real rooms before promotion.
 
 ### 6.6 What "done" means for Phase 1
 
-The **chaos harness (`e2e/` + `test-kit`)** is the deliverable. It spins up gateways + room-runtimes +
-fake SDK clients and injects faults, asserting **convergence + no-reload + no-dupes + no-lost-durable-events**:
+The **chaos harness (`test/chaos`)** is the deliverable — a Go deterministic-simulation suite (seeded
+clock/net/rng) plus a Go↔TS e2e rig. It spins up gateways + room-runtimes + fake SDK clients and injects
+faults, asserting **convergence + no-reload + no-dupes + no-lost-durable-events + at-most-one-owner**:
 - kill a gateway · kill the owner mid-write · kill an entire AZ · partition gateway↔owner ·
   wipe Redis (stream + coord) · simulate quorum loss · trigger a reconnect storm · roll a deploy.
 
