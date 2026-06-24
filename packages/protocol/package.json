@@ -9,5 +9,8 @@
     "build": "tsc -b",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "^2.12.1"
   }
 }

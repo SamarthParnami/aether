@@ -61,7 +61,21 @@ tasks:
     cmds:
       - golangci-lint fmt --diff
 
+  # --- Protobuf (buf) ---
+  proto:gen:
+    desc: Generate Go + TS from Protobuf
+    cmds:
+      - buf generate
+
+  proto:lint:
+    dir: '{{.ROOT_DIR}}'
+    cmds:
+      - buf lint
+
+  proto:breaking:
+    desc: Fail on backward-incompatible proto changes vs main
+    cmds:
+      - buf breaking --against '.git#branch=main'
+
   # --- Wired in later PRs ---
-  # proto:gen   -> buf generate           (PR-04 / PR-06)
-  # ts:build    -> yarn turbo run build   (PR-03)
-  # ts:test     -> yarn turbo run test    (PR-03)
+  # ts:build / ts:test -> yarn build / yarn test (PR-03 scripts; orchestration TBD)

@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package aether.v1;
+
+option go_package = "github.com/SamarthParnami/aether/go/gen/aether/v1;aetherv1";
+
+// Ping is a placeholder message that proves the Protobuf/Buf lane (lint, build,
+// codegen, breaking-change detection). The real wire envelope (ClientMessage /
+// ServerMessage / Event) and the event catalog land in PR-06 and PR-07.
+message Ping {
+  // id is an opaque correlation id.
+  string id = 1;
+}

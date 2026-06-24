@@ -8,6 +8,8 @@ __metadata:
 "@aether/protocol@workspace:packages/protocol":
   version: 0.0.0-use.local
   resolution: "@aether/protocol@workspace:packages/protocol"
+  dependencies:
+    "@bufbuild/protobuf": "npm:^2.12.1"
   languageName: unknown
   linkType: soft
 
@@ -60,6 +62,13 @@ __metadata:
   version: 1.0.2
   resolution: "@bcoe/v8-coverage@npm:1.0.2"
   checksum: 10c0/1eb1dc93cc17fb7abdcef21a6e7b867d6aa99a7ec88ec8207402b23d9083ab22a8011213f04b2cf26d535f1d22dc26139b7929e6c2134c254bd1e14ba5e678c3
+  languageName: node
+  linkType: hard
+
+"@bufbuild/protobuf@npm:^2.12.1":
+  version: 2.12.1
+  resolution: "@bufbuild/protobuf@npm:2.12.1"
+  checksum: 10c0/2d40cfe4ec3bb0e3f06ab2e28771dc5dc566eaacb055fbe893d75621b0407d0272d48f40a490ad47ded839ed541514e1af71bb13af024b3ae36ef0c56d56dda9
   languageName: node
   linkType: hard
 
