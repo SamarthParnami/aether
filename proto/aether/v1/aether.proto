@@ -2,12 +2,130 @@ syntax = "proto3";
 
 package aether.v1;
 
+import "aether/v1/events.proto";
+import "google/protobuf/timestamp.proto";
+
 option go_package = "github.com/SamarthParnami/aether/go/gen/aether/v1;aetherv1";
 
-// Ping is a placeholder message that proves the Protobuf/Buf lane (lint, build,
-// codegen, breaking-change detection). The real wire envelope (ClientMessage /
-// ServerMessage / Event) and the event catalog land in PR-06 and PR-07.
+// Aether wire protocol v1 — the WebSocket envelope.
+//
+// One disposable WebSocket per client, multiplexing one or more rooms (every
+// message carries room_id). Two QoS tiers are schema-enforced: durable
+// (Commit/Event/EventBody) vs ephemeral (Broadcast/Ephemeral/EphemeralBody).
+// Success of a Commit is signalled by the committed Event fanning back to the
+// originator (matched via origin_client_seq) — "fan-out is the ack"; only
+// failures get a Nack.
+
+// ===== Top-level WebSocket frames =====
+
+message ClientMessage {
+  oneof body {
+    Join join = 1;
+    Commit commit = 2; // durable tier
+    Broadcast broadcast = 3; // ephemeral tier
+    Leave leave = 4;
+    Ping ping = 5; // app-level keepalive
+  }
+}
+
+message ServerMessage {
+  oneof body {
+    Joined joined = 1;
+    Event event = 2; // a committed durable event (live OR replay); fan-out is the ack
+    Ephemeral ephemeral = 3;
+    Nack nack = 4; // a Commit was rejected
+    RoomStatus room_status = 5; // LIVE | FROZEN
+    Error error = 6;
+    Pong pong = 7;
+  }
+}
+
+// ===== Client -> Server =====
+
+message Join {
+  string room_id = 1;
+  uint64 from_seq = 2; // 0 = fresh (server sends a Snapshot); >0 = resume from this cursor
+}
+
+message Commit {
+  string room_id = 1;
+  uint64 client_seq = 2; // per-client monotonic; dedup key together with client_id
+  EventBody body = 3;
+}
+
+message Broadcast {
+  string room_id = 1;
+  EphemeralBody body = 2; // lossy: no ack, no dedup, no ordering guarantee
+}
+
+message Leave {
+  string room_id = 1;
+}
+
 message Ping {
-  // id is an opaque correlation id.
+  string id = 1; // echoed in Pong; for liveness / RTT
+}
+
+// ===== Server -> Client =====
+
+message Joined {
+  string room_id = 1;
+  string client_id = 2; // server-assigned, stable across reconnects of this session
+  uint64 current_seq = 3; // client is "live" once it has applied up to here
+  Snapshot snapshot = 4; // present on fresh join or deep resume
+}
+
+message Event {
+  string room_id = 1;
+  uint64 room_seq = 2; // authoritative ordering (the cursor)
+  string origin_client_id = 3; // who committed it
+  uint64 origin_client_seq = 4; // originator matches this -> fan-out is the ack
+  EventBody body = 5;
+  google.protobuf.Timestamp server_time = 6;
+}
+
+message Ephemeral {
+  string room_id = 1;
+  string origin_client_id = 2;
+  EphemeralBody body = 3;
+}
+
+message Nack {
+  string room_id = 1;
+  uint64 client_seq = 2; // which Commit was rejected
+  NackReason reason = 3;
+}
+
+enum NackReason {
+  NACK_REASON_UNSPECIFIED = 0;
+  NACK_REASON_PERMISSION_DENIED = 1;
+  NACK_REASON_OVERRIDDEN = 2; // an admin override superseded it
+  NACK_REASON_INVALID = 3;
+  NACK_REASON_RATE_LIMITED = 4;
+  NACK_REASON_NOT_JOINED = 5;
+}
+
+message RoomStatus {
+  string room_id = 1;
+  Status status = 2;
+
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_LIVE = 1;
+    STATUS_FROZEN = 2; // quorum loss / re-homing: durable commits paused
+  }
+}
+
+message Snapshot {
+  uint64 room_seq = 1; // state is materialized up to here
+  RoomState state = 2;
+}
+
+message Error {
+  string code = 1;
+  string message = 2;
+}
+
+message Pong {
   string id = 1;
 }
