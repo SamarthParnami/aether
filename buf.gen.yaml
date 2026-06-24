@@ -1,0 +1,13 @@
+version: v2
+clean: true
+plugins:
+  # Go structs → imported by the Go module (go/gen is gitignored, built in CI + `task proto:gen`)
+  - remote: buf.build/protocolbuffers/go
+    out: go/gen
+    opt: paths=source_relative
+  # TypeScript types → imported by @aether/protocol (gitignored, built in CI + `task proto:gen`)
+  - remote: buf.build/bufbuild/es
+    out: packages/protocol/src/gen
+    opt:
+      - target=ts
+      - import_extension=js
