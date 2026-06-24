@@ -75,3 +75,39 @@ func TestEventCarriesOrigin(t *testing.T) {
 		t.Errorf("room_seq/origin_client_seq = %d/%d, want 416/42", ev.GetRoomSeq(), ev.GetOriginClientSeq())
 	}
 }
+
+// The generic Phase-1 event (KeyValueSet) survives a round-trip — the test
+// vehicle the backbone exercises before the real catalog exists.
+func TestGenericKeyValueEvent(t *testing.T) {
+	msg := &aetherv1.ClientMessage{
+		Body: &aetherv1.ClientMessage_Commit{
+			Commit: &aetherv1.Commit{
+				RoomId:    "room-1",
+				ClientSeq: 7,
+				Body: &aetherv1.EventBody{
+					Kind: &aetherv1.EventBody_KvSet{
+						KvSet: &aetherv1.KeyValueSet{Key: "slide", Value: []byte("7")},
+					},
+				},
+			},
+		},
+	}
+
+	b, err := proto.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var got aetherv1.ClientMessage
+	if err := proto.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	kv := got.GetCommit().GetBody().GetKvSet()
+	if kv == nil {
+		t.Fatalf("expected kv_set body")
+	}
+	if kv.GetKey() != "slide" || string(kv.GetValue()) != "7" {
+		t.Errorf("kv = %q/%q, want slide/7", kv.GetKey(), string(kv.GetValue()))
+	}
+}

@@ -4,15 +4,41 @@ package aether.v1;
 
 option go_package = "github.com/SamarthParnami/aether/go/gen/aether/v1;aetherv1";
 
-// EventBody is the payload of a durable, ordered event. The concrete catalog
-// (SlideSet, Mute, HandRaise, AdminOverride, …) is a oneof added in PR-07; this
-// is an additive placeholder so the envelope compiles and the contract is frozen.
-message EventBody {}
+// EventBody is the payload of a durable, ordered event.
+//
+// For Phase 1 we carry a single GENERIC event (KeyValueSet) — enough to exercise
+// the backbone (ordering, dedup, snapshot/replay, convergence) without committing
+// to feature semantics. Phase 2 adds the real catalog (SlideSet, Mute, HandRaise,
+// AdminOverride, …) as additional oneof members — purely additive, so `buf
+// breaking` stays green.
+message EventBody {
+  oneof kind {
+    KeyValueSet kv_set = 1; // generic Phase-1 test event
+    // Phase 2: SlideSet slide_set = 2; Mute mute = 3; ...
+  }
+}
 
-// EphemeralBody is the payload of a lossy, unordered broadcast (Cursor,
-// Presence, …). Populated in PR-07.
-message EphemeralBody {}
+// EphemeralBody is the payload of a lossy, unordered broadcast (cursors, presence).
+// Phase 1 uses the same generic KeyValueSet; Phase 2 adds Cursor/Presence/…
+message EphemeralBody {
+  oneof kind {
+    KeyValueSet kv_set = 1; // generic Phase-1 ephemeral
+    // Phase 2: Cursor cursor = 2; Presence presence = 3; ...
+  }
+}
 
-// RoomState is the materialized room state carried in a Snapshot. Its fields
-// (current_slide, raised hands, mutes, …) are added with the catalog in PR-07.
-message RoomState {}
+// KeyValueSet is the generic Phase-1 event/ephemeral: "set key = value".
+// The Phase-1 reducer folds these into RoomState as last-write-wins by room_seq.
+message KeyValueSet {
+  string key = 1;
+  bytes value = 2;
+}
+
+// RoomState is the materialized room state carried in a Snapshot.
+//
+// Phase 1: a generic last-write-wins key/value map produced by folding KeyValueSet
+// events. Phase 2 adds typed fields (current_slide, raised_hands, mutes, …)
+// additively alongside the map.
+message RoomState {
+  map<string, bytes> entries = 1;
+}
