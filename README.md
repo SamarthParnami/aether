@@ -15,6 +15,15 @@ This folder holds the design and planning docs for the build.
 | [01-design-backbone.md](01-design-backbone.md) | Engineering (deep) | The actionable design: why, the 3-phase plan, **Phase 1 in depth**, locked decisions, the quantitative "what happens if" FAQ, and the test strategy. |
 | [02-brief-engineering.md](02-brief-engineering.md) | Engineering (skim) | One-page eng brief: the shape of the system, the headline decisions, what Phase 1 ships. |
 | [03-brief-leadership.md](03-brief-leadership.md) | PM / Leadership | Plain-language: the problem, why we're rebuilding, the phased plan, risk & SLA posture. |
+| [04-phase1-implementation-plan.md](04-phase1-implementation-plan.md) | Engineering | **The build plan:** stack decisions (Go backend · React frontend · Protobuf/Buf contract), tooling/testing/workflow grounded in current best practices, and the **incremental PR-by-PR sequence** for Phase 1. |
+
+## Stack (decided)
+
+- **Backend:** Go (`gateway` + `room-runtime`). **Frontend:** React + TypeScript. **SDK:** TypeScript.
+- **Contract:** Protobuf + Buf (`buf breaking` enforces the frozen contract); Go↔TS reducer parity via golden vectors.
+- **Truth:** DynamoDB (per-room conditional-write log). **Hot tail / fan-out / leases:** Redis + Dynamo leases.
+- See [04](04-phase1-implementation-plan.md) §1 for full rationale; [01](01-design-backbone.md) §5 for the
+  conceptual map. Both docs reflect the Go/React/Protobuf decision.
 
 ## Status
 
