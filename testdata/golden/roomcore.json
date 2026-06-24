@@ -1,0 +1,41 @@
+{
+  "description": "Golden vectors for the roomcore reducer (generic KeyValueSet fold, last-write-wins). Both the Go fold and the TS SDK reducer must reproduce `expected` by folding `events` in order. Values are UTF-8 strings.",
+  "cases": [
+    { "name": "empty", "events": [], "expected": {} },
+    {
+      "name": "single set",
+      "events": [{ "key": "slide", "value": "7" }],
+      "expected": { "slide": "7" }
+    },
+    {
+      "name": "last write wins",
+      "events": [
+        { "key": "slide", "value": "7" },
+        { "key": "slide", "value": "9" }
+      ],
+      "expected": { "slide": "9" }
+    },
+    {
+      "name": "multiple keys",
+      "events": [
+        { "key": "slide", "value": "3" },
+        { "key": "presenter", "value": "alice" }
+      ],
+      "expected": { "slide": "3", "presenter": "alice" }
+    },
+    {
+      "name": "overwrite then other key",
+      "events": [
+        { "key": "a", "value": "1" },
+        { "key": "a", "value": "2" },
+        { "key": "b", "value": "x" }
+      ],
+      "expected": { "a": "2", "b": "x" }
+    },
+    {
+      "name": "empty value",
+      "events": [{ "key": "k", "value": "" }],
+      "expected": { "k": "" }
+    }
+  ]
+}
