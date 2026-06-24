@@ -1,0 +1,45 @@
+# Unified entrypoint for the polyglot monorepo (Go + TS + Protobuf).
+# Install Task: https://taskfile.dev/installation/
+version: '3'
+
+tasks:
+  default:
+    cmds:
+      - task --list
+    silent: true
+
+  build:
+    desc: Build everything (Go now; TS/proto wired as those PRs land)
+    cmds:
+      - task: go:build
+
+  test:
+    desc: Test everything
+    cmds:
+      - task: go:test
+
+  lint:
+    desc: Lint everything (golangci-lint/eslint wired in PR-02/PR-03)
+    cmds:
+      - task: go:vet
+
+  # --- Go ---
+  go:build:
+    dir: go
+    cmds:
+      - go build ./...
+
+  go:test:
+    dir: go
+    cmds:
+      - go test -race ./...
+
+  go:vet:
+    dir: go
+    cmds:
+      - go vet ./...
+
+  # --- Wired in later PRs ---
+  # proto:gen   -> buf generate           (PR-04 / PR-06)
+  # ts:build    -> yarn turbo run build   (PR-03)
+  # ts:test     -> yarn turbo run test    (PR-03)
