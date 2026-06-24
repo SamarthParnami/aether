@@ -1,0 +1,19 @@
+{
+  "name": "aether",
+  "version": "0.0.0",
+  "private": true,
+  "packageManager": "yarn@4.5.3",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "turbo run build",
+    "test": "turbo run test",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck"
+  }
+}
