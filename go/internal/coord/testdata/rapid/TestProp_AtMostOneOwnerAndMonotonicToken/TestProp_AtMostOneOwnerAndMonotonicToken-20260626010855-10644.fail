@@ -1,0 +1,67 @@
+# 2026/06/26 01:08:55.960437 [TestProp_AtMostOneOwnerAndMonotonicToken] [rapid] draw steps: 4
+# 2026/06/26 01:08:55.960478 [TestProp_AtMostOneOwnerAndMonotonicToken] [rapid] draw dt: 0
+# 2026/06/26 01:08:55.960486 [TestProp_AtMostOneOwnerAndMonotonicToken] [rapid] draw owner: "A"
+# 2026/06/26 01:08:55.960497 [TestProp_AtMostOneOwnerAndMonotonicToken] [rapid] draw ttl: 1
+# 2026/06/26 01:08:55.960504 [TestProp_AtMostOneOwnerAndMonotonicToken] [rapid] draw op: 0
+# 2026/06/26 01:08:55.960514 [TestProp_AtMostOneOwnerAndMonotonicToken] [rapid] draw dt: 1
+# 2026/06/26 01:08:55.960520 [TestProp_AtMostOneOwnerAndMonotonicToken] [rapid] draw owner: "A"
+# 2026/06/26 01:08:55.960527 [TestProp_AtMostOneOwnerAndMonotonicToken] [rapid] draw ttl: 1
+# 2026/06/26 01:08:55.960533 [TestProp_AtMostOneOwnerAndMonotonicToken] [rapid] draw op: 0
+# 2026/06/26 01:08:55.960542 [TestProp_AtMostOneOwnerAndMonotonicToken] [rapid] draw dt: 0
+# 2026/06/26 01:08:55.960548 [TestProp_AtMostOneOwnerAndMonotonicToken] [rapid] draw owner: "A"
+# 2026/06/26 01:08:55.960554 [TestProp_AtMostOneOwnerAndMonotonicToken] [rapid] draw ttl: 1
+# 2026/06/26 01:08:55.960560 [TestProp_AtMostOneOwnerAndMonotonicToken] [rapid] draw op: 2
+# 2026/06/26 01:08:55.960569 [TestProp_AtMostOneOwnerAndMonotonicToken] [rapid] draw dt: 0
+# 2026/06/26 01:08:55.960575 [TestProp_AtMostOneOwnerAndMonotonicToken] [rapid] draw owner: "A"
+# 2026/06/26 01:08:55.960581 [TestProp_AtMostOneOwnerAndMonotonicToken] [rapid] draw ttl: 1
+# 2026/06/26 01:08:55.960587 [TestProp_AtMostOneOwnerAndMonotonicToken] [rapid] draw op: 0
+# 2026/06/26 01:08:55.960604 [TestProp_AtMostOneOwnerAndMonotonicToken] token decreased: 1 < 2
+# 
+v0.4.8#2063759524625206751
+0x0
+0x6b74f03291620
+0x4
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x1
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x38e38e38e38e4
+0x2
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
