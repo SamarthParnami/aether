@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestDeliversWithoutFaults(t *testing.T) {
@@ -60,10 +61,13 @@ func TestDropAllDeliveries(t *testing.T) {
 func TestDeterministicReplay(t *testing.T) {
 	run := func(seed int64) []string {
 		s := New(seed)
-		net := NewNetwork(s, FaultConfig{DropProb: 0.3, DupProb: 0.2, MinDelay: 1, MaxDelay: 6})
+		net := NewNetwork(s, FaultConfig{
+			DropProb: 0.3, DupProb: 0.2,
+			MinDelay: time.Millisecond, MaxDelay: 6 * time.Millisecond,
+		})
 		var log []string
 		net.Register("B", func(from NodeID, msg any) {
-			log = append(log, fmt.Sprintf("t%d:%s:%v", s.Now(), from, msg))
+			log = append(log, fmt.Sprintf("t%d:%s:%v", s.Now().UnixNano(), from, msg))
 		})
 		for i := range make([]struct{}, 20) {
 			net.Send("A", "B", i)

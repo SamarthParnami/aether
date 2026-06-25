@@ -1,5 +1,7 @@
 package sim
 
+import "time"
+
 // NodeID identifies a node in the simulated network.
 type NodeID string
 
@@ -9,10 +11,10 @@ type Handler func(from NodeID, msg any)
 // FaultConfig controls the faults the network injects. The zero value is a perfect
 // network: no drops, no duplicates, immediate in-order delivery.
 type FaultConfig struct {
-	DropProb float64 // probability in [0,1) that a message is silently dropped
-	DupProb  float64 // probability in [0,1) that a message is delivered twice
-	MinDelay uint64  // minimum delivery delay in ticks
-	MaxDelay uint64  // maximum delivery delay in ticks; > MinDelay makes delivery reorder
+	DropProb float64       // probability in [0,1) that a message is silently dropped
+	DupProb  float64       // probability in [0,1) that a message is delivered twice
+	MinDelay time.Duration // minimum delivery delay
+	MaxDelay time.Duration // maximum delivery delay; > MinDelay makes delivery reorder
 }
 
 // Network is an in-memory message bus over a Sim. Delivery delay, drops, duplicates,
@@ -69,8 +71,8 @@ func (n *Network) Send(from, to NodeID, msg any) {
 func (n *Network) scheduleDelivery(from, to NodeID, msg any) {
 	delay := n.cfg.MinDelay
 	if n.cfg.MaxDelay > n.cfg.MinDelay {
-		span := int64(n.cfg.MaxDelay - n.cfg.MinDelay + 1)
-		delay += uint64(n.sim.rng.Int63n(span))
+		span := int64(n.cfg.MaxDelay-n.cfg.MinDelay) + 1
+		delay += time.Duration(n.sim.rng.Int63n(span))
 	}
 	n.sim.Schedule(delay, func() {
 		// The link may have partitioned between send and delivery.
