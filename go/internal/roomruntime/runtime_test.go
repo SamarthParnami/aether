@@ -73,6 +73,44 @@ func TestDuplicateCommitIsIgnored(t *testing.T) {
 	}
 }
 
+// Join returns a CLONE: a later Commit must not mutate state a join caller is still holding
+// (the live-map aliasing that would be a fatal concurrent map read/write).
+func TestJoinReturnsClonedSnapshot(t *testing.T) {
+	ctx := context.Background()
+	rt := roomruntime.New(logstore.NewMemory(), fanout.NewMemory())
+
+	rt.Commit(ctx, "room", "A", 1, kvBody("slide", "7"))
+	joined, _ := rt.Join(ctx, "room")
+
+	rt.Commit(ctx, "room", "A", 2, kvBody("slide", "9")) // mutates the live room state
+
+	if got := string(joined.GetSnapshot().GetState().GetEntries()["slide"]); got != "7" {
+		t.Fatalf("join snapshot aliased live state: slide=%q, want 7 (pinned at the join)", got)
+	}
+}
+
+// Fan-out runs outside the lock: a subscriber that re-enters the Runtime (here Join) while
+// handling an event must not deadlock the non-reentrant mutex.
+func TestReentrantSubscriberDoesNotDeadlock(t *testing.T) {
+	ctx := context.Background()
+	fo := fanout.NewMemory()
+	rt := roomruntime.New(logstore.NewMemory(), fo)
+
+	done := make(chan struct{})
+	fo.Subscribe("room", func(*aetherv1.Event) {
+		rt.Join(ctx, "other") // re-enters the Runtime from within a fan-out handler
+		close(done)
+	})
+
+	rt.Commit(ctx, "room", "A", 1, kvBody("k", "v"))
+
+	select {
+	case <-done:
+	default:
+		t.Fatal("re-entrant subscriber deadlocked (Publish held the lock)")
+	}
+}
+
 // The reconstruction property that failover rests on: a fresh Runtime on the same log
 // rebuilds the exact room state (and dedups already-applied commits) — no shared memory.
 func TestReconstructsFromLogOnAnotherRuntime(t *testing.T) {

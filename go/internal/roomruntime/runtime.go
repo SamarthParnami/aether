@@ -24,6 +24,10 @@ type Runtime struct {
 	log    logstore.LogStore
 	fanout fanout.Fanout
 
+	// A single Runtime-wide mutex serializes all rooms, and is held across the durable append
+	// — a deliberate single-node Phase-1 simplification. Per-room serialization (a per-room
+	// lock or owner-actor goroutine) replaces it when this is sharded/scaled. Fan-out already
+	// happens outside the lock (see Commit) so subscribers can't stall or deadlock it.
 	mu    sync.Mutex
 	rooms map[string]*roomcore.Room
 }
@@ -41,7 +45,22 @@ func New(log logstore.LogStore, fo fanout.Fanout) *Runtime {
 //     it rebuilds from the log (a conflict means this node is not really the owner).
 func (r *Runtime) Commit(
 	ctx context.Context, roomID, clientID string, clientSeq uint64, body *aetherv1.EventBody,
-) (event *aetherv1.Event, applied bool, err error) {
+) (*aetherv1.Event, bool, error) {
+	ev, applied, err := r.commitLocked(ctx, roomID, clientID, clientSeq, body)
+	if applied {
+		// Fan-out is the ack — published OUTSIDE the lock on purpose. Subscriber handlers run
+		// synchronously, so publishing under r.mu would let a slow subscriber stall every room
+		// and would deadlock a subscriber that calls back into Commit/Join (mutex is non-reentrant).
+		r.fanout.Publish(roomID, ev)
+	}
+	return ev, applied, err
+}
+
+// commitLocked runs the durable critical section under the lock and returns the committed
+// event without publishing it (the caller publishes after unlocking).
+func (r *Runtime) commitLocked(
+	ctx context.Context, roomID, clientID string, clientSeq uint64, body *aetherv1.EventBody,
+) (*aetherv1.Event, bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -60,8 +79,6 @@ func (r *Runtime) Commit(
 		delete(r.rooms, roomID) // stale/lost ownership — discard so the next access rebuilds
 		return nil, false, err
 	}
-
-	r.fanout.Publish(roomID, ev) // fan-out is the ack
 	return ev, true, nil
 }
 
@@ -76,10 +93,14 @@ func (r *Runtime) Join(ctx context.Context, roomID string) (*aetherv1.Joined, er
 	if err != nil {
 		return nil, err
 	}
+	// Snapshot() returns a CLONE — never hand out the room's live, mutable state, or a later
+	// Commit's fold would race (fatal concurrent map read/write) a caller still reading it, and
+	// the snapshot wouldn't actually be pinned at CurrentSeq.
+	snap := room.Snapshot()
 	return &aetherv1.Joined{
 		RoomId:     roomID,
-		CurrentSeq: room.Seq(),
-		Snapshot:   &aetherv1.Snapshot{RoomSeq: room.Seq(), State: room.State()},
+		CurrentSeq: snap.RoomSeq,
+		Snapshot:   &aetherv1.Snapshot{RoomSeq: snap.RoomSeq, State: snap.State},
 	}, nil
 }
 
