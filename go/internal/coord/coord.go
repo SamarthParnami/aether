@@ -11,6 +11,13 @@
 // testable — there is no hidden wall clock. Using time.Time / time.Duration (rather than an
 // abstract unit) means callers express TTLs the same way in tests and prod (e.g. 6*time.Second)
 // and drive `now` from the sim clock under test or the wall clock in prod, with no converter.
+//
+// Clock skew: in prod `now` is the wall clock, so a lease's Expiry is set by the owner's
+// clock but evaluated by a survivor's on failover. Failover *timing* therefore assumes
+// TTL >> max inter-node clock skew. This is not a safety hole — the hard backstop above
+// (conditional write + fencing token) still prevents a double-owner write; skew can only
+// widen the failover-detection window. Lease *renewal scheduling* should read a monotonic
+// clock; only the expiry comparisons here use these wall-clock instants.
 package coord
 
 import "time"
