@@ -7,15 +7,19 @@
 // the durable log's conditional write (logstore.ErrConflict) is the *hard* backstop that
 // makes split-brain writes fail even if the lease is briefly wrong.
 //
-// Time is passed in explicitly as `now` (same logical unit as the TTLs) so the layer is
-// deterministic and testable — there is no hidden wall clock.
+// Time (`now`) and the TTL are passed in explicitly so the layer is deterministic and
+// testable — there is no hidden wall clock. Using time.Time / time.Duration (rather than an
+// abstract unit) means callers express TTLs the same way in tests and prod (e.g. 6*time.Second)
+// and drive `now` from the sim clock under test or the wall clock in prod, with no converter.
 package coord
+
+import "time"
 
 // Lease is a time-bound ownership token for a room.
 type Lease struct {
-	Owner  string // node id currently holding the room
-	Expiry uint64 // logical time at which the lease lapses
-	Token  uint64 // fencing token; increments on every ownership takeover
+	Owner  string    // node id currently holding the room
+	Expiry time.Time // instant at which the lease lapses
+	Token  uint64    // fencing token; increments on every ownership takeover
 }
 
 // Coordinator manages room ownership and answers the directory lookup.
@@ -25,11 +29,11 @@ type Coordinator interface {
 	// free/expired lease) bumps the fencing token; a re-claim by the current holder keeps
 	// it. Returns the granted lease and true, or a zero lease and false when another node
 	// holds an unexpired lease.
-	Claim(roomID, owner string, now, ttl uint64) (Lease, bool)
+	Claim(roomID, owner string, now time.Time, ttl time.Duration) (Lease, bool)
 
 	// Renew extends owner's lease. Returns false (ownership lost) if owner is not the
 	// current unexpired holder.
-	Renew(roomID, owner string, now, ttl uint64) (Lease, bool)
+	Renew(roomID, owner string, now time.Time, ttl time.Duration) (Lease, bool)
 
 	// Release relinquishes ownership if owner holds it — a graceful handoff on shutdown,
 	// so a survivor can claim immediately instead of waiting out the TTL.
@@ -37,5 +41,5 @@ type Coordinator interface {
 
 	// Current returns the unexpired lease for a room: the directory lookup gateways use to
 	// route. Returns false if the room is unowned or its lease has lapsed.
-	Current(roomID string, now uint64) (Lease, bool)
+	Current(roomID string, now time.Time) (Lease, bool)
 }
