@@ -14,14 +14,27 @@ export function emptyState(): MaterializedState {
   return new Map();
 }
 
-/** Fold one event body into state (mutating it). Last-write-wins for KeyValueSet. */
+/**
+ * Fold one event body into state (mutating it). Last-write-wins for KeyValueSet.
+ *
+ * The value bytes are copied (`.slice()`) before storing — matching Go's `fold`, which
+ * defensively copies — so room state never aliases the (possibly reused/pooled) buffer the
+ * event was decoded into. Skipping this would be a silent Go↔TS divergence the golden
+ * vectors can't catch (every fixture uses fresh values).
+ */
 export function fold(state: MaterializedState, body: EventBody): void {
   if (body.kind.case === 'kvSet') {
-    state.set(body.kind.value.key, body.kind.value.value);
+    state.set(body.kind.value.key, body.kind.value.value.slice());
   }
 }
 
-/** Rebuild state by folding events in order — the client-side reconstruction path. */
+/**
+ * Rebuild state by folding events in order, from genesis.
+ *
+ * Genesis-only by design for now. The snapshot-base recovery path (the TS counterpart of
+ * Go's `Replay(snapshot, tail)` — apply a gap backfill onto a received Snapshot@N) lands
+ * with the SDK recovery PR, where the cursor/RESUME logic lives.
+ */
 export function replay(events: EventBody[]): MaterializedState {
   const state = emptyState();
   for (const body of events) {

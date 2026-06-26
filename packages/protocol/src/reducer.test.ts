@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 import { create } from '@bufbuild/protobuf';
 import { describe, expect, it } from 'vitest';
@@ -14,9 +15,13 @@ interface GoldenSuite {
   }[];
 }
 
-// The SAME fixtures the Go roomcore golden test uses — read from the repo-root path
-// (vitest runs from the repo root). This is the cross-language parity guarantee.
-const suite = JSON.parse(readFileSync('testdata/golden/roomcore.json', 'utf8')) as GoldenSuite;
+// The SAME fixtures the Go roomcore golden test uses. Resolve the path relative to THIS
+// file (not process.cwd()) so the parity check keeps running even if the suite is run
+// package-scoped — a silently-skipped guard would be the worst failure mode here.
+const goldenPath = fileURLToPath(
+  new URL('../../../testdata/golden/roomcore.json', import.meta.url),
+);
+const suite = JSON.parse(readFileSync(goldenPath, 'utf8')) as GoldenSuite;
 
 describe('roomcore golden vectors (TS ↔ Go parity)', () => {
   it('has cases', () => {
