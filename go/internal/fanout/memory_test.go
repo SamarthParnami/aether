@@ -49,6 +49,21 @@ func TestCancelStopsDelivery(t *testing.T) {
 	}
 }
 
+// A panicking subscriber is contained: it neither aborts delivery to other subscribers
+// nor unwinds into the caller (the owner's commit path).
+func TestPanickingSubscriberIsIsolated(t *testing.T) {
+	f := fanout.NewMemory()
+	delivered := false
+	f.Subscribe("r", func(*aetherv1.Event) { panic("bad gateway handler") })
+	f.Subscribe("r", func(*aetherv1.Event) { delivered = true })
+
+	f.Publish("r", event(1)) // must not panic out of Publish
+
+	if !delivered {
+		t.Fatal("a panicking subscriber skipped a later subscriber")
+	}
+}
+
 func TestPerRoomIsolation(t *testing.T) {
 	f := fanout.NewMemory()
 	gotA, gotB := 0, 0
