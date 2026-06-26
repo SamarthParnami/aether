@@ -12,10 +12,19 @@ import (
 
 // Subscription is a handle used to stop receiving a room's events.
 type Subscription interface {
+	// Cancel stops future deliveries to this subscriber. It is NOT synchronized against a
+	// Publish already in flight: a delivery whose recipient set was captured before Cancel
+	// returned may still invoke the handler once afterwards. Handlers must tolerate a
+	// trailing event after Cancel.
 	Cancel()
 }
 
 // Fanout delivers a room's events from its owner to all current subscribers.
+//
+// Delivery is LIVE-ONLY: an event published while a room has no subscriber is dropped —
+// there is no backlog. Catch-up after a (re)subscribe is the durable log's job (logstore
+// replay from a cursor), not the fan-out bus's. (The real Redis-Streams impl retains a
+// window of history, but callers must not depend on that for correctness.)
 type Fanout interface {
 	// Publish delivers event to every current subscriber of roomID.
 	Publish(roomID string, event *aetherv1.Event)

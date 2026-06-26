@@ -22,6 +22,9 @@ bin/
 *.test
 *.out
 
+# rapid property-test failure repros (auto-written on failure, auto-deleted on pass)
+**/testdata/rapid/
+
 # Generated from Protobuf (buf generate — built in CI + `task proto:gen`)
 go/gen/
 packages/*/src/gen/

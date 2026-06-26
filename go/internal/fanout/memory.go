@@ -38,7 +38,10 @@ func (m *Memory) Subscribe(roomID string, fn func(*aetherv1.Event)) Subscription
 }
 
 // Publish implements Fanout. Handlers are invoked outside the lock (in subscription order)
-// so a subscriber may itself publish or (un)subscribe without deadlocking.
+// so a subscriber may itself publish or (un)subscribe without deadlocking. Each handler is
+// isolated: a panicking subscriber is contained (recovered) so it can neither skip later
+// subscribers nor unwind into the owner's commit path. (Fail-isolated, not fail-fast — one
+// bad gateway handler must not take down delivery for a whole room.)
 func (m *Memory) Publish(roomID string, event *aetherv1.Event) {
 	m.mu.Lock()
 	subs := m.subs[roomID]
@@ -49,8 +52,14 @@ func (m *Memory) Publish(roomID string, event *aetherv1.Event) {
 	m.mu.Unlock()
 
 	for _, fn := range fns {
-		fn(event)
+		deliver(fn, event)
 	}
+}
+
+// deliver invokes one handler, containing any panic so it stays isolated to that subscriber.
+func deliver(fn func(*aetherv1.Event), event *aetherv1.Event) {
+	defer func() { _ = recover() }()
+	fn(event)
 }
 
 type memSub struct {
@@ -67,7 +76,12 @@ func (s *memSub) Cancel() {
 	subs := s.m.subs[s.roomID]
 	for i, sub := range subs {
 		if sub.id == s.id {
-			s.m.subs[s.roomID] = append(subs[:i], subs[i+1:]...)
+			subs = append(subs[:i], subs[i+1:]...)
+			if len(subs) == 0 {
+				delete(s.m.subs, s.roomID) // don't leave empty slices to leak the map entry
+			} else {
+				s.m.subs[s.roomID] = subs
+			}
 			return
 		}
 	}
