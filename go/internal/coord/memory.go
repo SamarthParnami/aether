@@ -1,6 +1,9 @@
 package coord
 
-import "sync"
+import (
+	"sync"
+	"time"
+)
 
 // Memory is an in-memory Coordinator for tests and local development. Safe for concurrent
 // use. The durable implementation (DynamoDB conditional writes + TTL) lands later behind
@@ -16,23 +19,23 @@ func NewMemory() *Memory {
 }
 
 // Claim implements Coordinator.
-func (m *Memory) Claim(roomID, owner string, now, ttl uint64) (Lease, bool) {
+func (m *Memory) Claim(roomID, owner string, now time.Time, ttl time.Duration) (Lease, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	cur, exists := m.leases[roomID]
-	held := exists && now < cur.Expiry
+	held := exists && now.Before(cur.Expiry)
 
 	switch {
 	case !held:
 		// Free (unowned or expired): take it as a fresh ownership and bump the token so any
 		// stale writes from a previous owner are fenced out.
-		l := Lease{Owner: owner, Expiry: now + ttl, Token: cur.Token + 1}
+		l := Lease{Owner: owner, Expiry: now.Add(ttl), Token: cur.Token + 1}
 		m.leases[roomID] = l
 		return l, true
 	case cur.Owner == owner:
 		// Re-claim by the current holder acts like a renew: extend, keep the token.
-		l := Lease{Owner: owner, Expiry: now + ttl, Token: cur.Token}
+		l := Lease{Owner: owner, Expiry: now.Add(ttl), Token: cur.Token}
 		m.leases[roomID] = l
 		return l, true
 	default:
@@ -42,15 +45,15 @@ func (m *Memory) Claim(roomID, owner string, now, ttl uint64) (Lease, bool) {
 }
 
 // Renew implements Coordinator.
-func (m *Memory) Renew(roomID, owner string, now, ttl uint64) (Lease, bool) {
+func (m *Memory) Renew(roomID, owner string, now time.Time, ttl time.Duration) (Lease, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	cur, exists := m.leases[roomID]
-	if !exists || cur.Owner != owner || now >= cur.Expiry {
+	if !exists || cur.Owner != owner || !now.Before(cur.Expiry) {
 		return Lease{}, false // lost
 	}
-	l := Lease{Owner: owner, Expiry: now + ttl, Token: cur.Token}
+	l := Lease{Owner: owner, Expiry: now.Add(ttl), Token: cur.Token}
 	m.leases[roomID] = l
 	return l, true
 }
@@ -64,18 +67,18 @@ func (m *Memory) Release(roomID, owner string) {
 	defer m.mu.Unlock()
 
 	if cur, ok := m.leases[roomID]; ok && cur.Owner == owner {
-		cur.Expiry = 0 // expired now (now is always >= 0), but Token is preserved
+		cur.Expiry = time.Time{} // zero time is before any real `now`, but Token is preserved
 		m.leases[roomID] = cur
 	}
 }
 
 // Current implements Coordinator.
-func (m *Memory) Current(roomID string, now uint64) (Lease, bool) {
+func (m *Memory) Current(roomID string, now time.Time) (Lease, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	cur, exists := m.leases[roomID]
-	if !exists || now >= cur.Expiry {
+	if !exists || !now.Before(cur.Expiry) {
 		return Lease{}, false
 	}
 	return cur, true

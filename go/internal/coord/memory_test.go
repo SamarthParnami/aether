@@ -2,31 +2,35 @@ package coord_test
 
 import (
 	"testing"
+	"time"
 
 	"pgregory.net/rapid"
 
 	"github.com/SamarthParnami/aether/go/internal/coord"
 )
 
+// t0 is an arbitrary, fixed base instant for the unit tests.
+var t0 = time.Unix(1000, 0)
+
 func TestClaimEmptyAndContested(t *testing.T) {
 	m := coord.NewMemory()
 
-	l, ok := m.Claim("r", "A", 0, 10)
+	l, ok := m.Claim("r", "A", t0, 10*time.Second)
 	if !ok || l.Owner != "A" || l.Token != 1 {
 		t.Fatalf("first claim = %+v, %v", l, ok)
 	}
 
 	// B cannot claim while A's lease is live.
-	if _, ok := m.Claim("r", "B", 5, 10); ok {
+	if _, ok := m.Claim("r", "B", t0.Add(5*time.Second), 10*time.Second); ok {
 		t.Fatal("B claimed a room A still holds")
 	}
 }
 
 func TestTakeoverAfterExpiryBumpsToken(t *testing.T) {
 	m := coord.NewMemory()
-	m.Claim("r", "A", 0, 10) // expires at 10
+	m.Claim("r", "A", t0, 10*time.Second) // expires at t0+10s
 
-	l, ok := m.Claim("r", "B", 11, 10) // after expiry
+	l, ok := m.Claim("r", "B", t0.Add(11*time.Second), 10*time.Second) // after expiry
 	if !ok || l.Owner != "B" {
 		t.Fatalf("takeover failed: %+v, %v", l, ok)
 	}
@@ -37,43 +41,43 @@ func TestTakeoverAfterExpiryBumpsToken(t *testing.T) {
 
 func TestRenew(t *testing.T) {
 	m := coord.NewMemory()
-	first, _ := m.Claim("r", "A", 0, 10)
+	first, _ := m.Claim("r", "A", t0, 10*time.Second)
 
-	l, ok := m.Renew("r", "A", 5, 10) // still ours
-	if !ok || l.Expiry != 15 || l.Token != first.Token {
+	l, ok := m.Renew("r", "A", t0.Add(5*time.Second), 10*time.Second) // still ours
+	if !ok || !l.Expiry.Equal(t0.Add(15*time.Second)) || l.Token != first.Token {
 		t.Fatalf("renew = %+v, %v", l, ok)
 	}
-	if _, ok := m.Renew("r", "B", 5, 10); ok {
+	if _, ok := m.Renew("r", "B", t0.Add(5*time.Second), 10*time.Second); ok {
 		t.Fatal("B renewed a lease it doesn't hold")
 	}
-	if _, ok := m.Renew("r", "A", 100, 10); ok {
+	if _, ok := m.Renew("r", "A", t0.Add(100*time.Second), 10*time.Second); ok {
 		t.Fatal("renew succeeded after expiry")
 	}
 }
 
 func TestReleaseFreesRoom(t *testing.T) {
 	m := coord.NewMemory()
-	m.Claim("r", "A", 0, 100)
+	m.Claim("r", "A", t0, 100*time.Second)
 
 	m.Release("r", "B") // not the owner: no-op
-	if _, ok := m.Current("r", 1); !ok {
+	if _, ok := m.Current("r", t0.Add(time.Second)); !ok {
 		t.Fatal("non-owner release freed the room")
 	}
 
 	m.Release("r", "A")
-	if _, ok := m.Current("r", 1); ok {
+	if _, ok := m.Current("r", t0.Add(time.Second)); ok {
 		t.Fatal("owner release did not free the room")
 	}
 }
 
 func TestCurrentRespectsExpiry(t *testing.T) {
 	m := coord.NewMemory()
-	m.Claim("r", "A", 0, 10)
+	m.Claim("r", "A", t0, 10*time.Second)
 
-	if _, ok := m.Current("r", 9); !ok {
+	if _, ok := m.Current("r", t0.Add(9*time.Second)); !ok {
 		t.Fatal("Current false before expiry")
 	}
-	if _, ok := m.Current("r", 10); ok {
+	if _, ok := m.Current("r", t0.Add(10*time.Second)); ok {
 		t.Fatal("Current true at/after expiry")
 	}
 }
@@ -85,16 +89,17 @@ func TestProp_AtMostOneOwnerAndMonotonicToken(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		m := coord.NewMemory()
 		owners := []string{"A", "B"}
-		var now, lastToken uint64
+		now := time.Unix(0, 0)
+		var lastToken uint64
 
 		for range make([]struct{}, rapid.IntRange(0, 60).Draw(t, "steps")) {
-			now += uint64(rapid.IntRange(0, 10).Draw(t, "dt"))
+			now = now.Add(time.Duration(rapid.IntRange(0, 10).Draw(t, "dt")) * time.Second)
 			o := rapid.SampledFrom(owners).Draw(t, "owner")
 			other := "A"
 			if o == "A" {
 				other = "B"
 			}
-			ttl := uint64(rapid.IntRange(1, 6).Draw(t, "ttl"))
+			ttl := time.Duration(rapid.IntRange(1, 6).Draw(t, "ttl")) * time.Second
 
 			switch rapid.IntRange(0, 2).Draw(t, "op") {
 			case 0:
