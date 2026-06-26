@@ -1,28 +1,57 @@
 // Package roomruntime is the room owner: it wires the pure roomcore reducer to the durable
 // log (logstore) and the delivery bus (fanout) to serve the write journey.
 //
-// The journey for a durable commit is: dedup → assign room_seq → APPEND to the log and only
-// then ("ack-after-persist") → fan out the committed event. The fan-out IS the ack: the
-// event carries the originator's client_seq, so the sender recognizes its own commit coming
-// back. A room's state is reconstructed by replaying its log, so any node can rebuild it —
-// the basis of failover (added with coordination in a later PR).
+// The journey for a durable commit is: confirm ownership → dedup → assign room_seq → APPEND
+// to the log and only then ("ack-after-persist") → fan out the committed event. The fan-out
+// IS the ack: the event carries the originator's client_seq, so the sender recognizes its own
+// commit coming back. A room's state is reconstructed by replaying its log, so any node can
+// rebuild it — the basis of failover.
+//
+// Ownership (two layered guards):
+//   - Soft: before serving a room a Runtime confirms a coord lease (claim-or-renew). A node
+//     that cannot hold the lease refuses to act as owner (ErrNotOwner) and drops its in-memory
+//     copy of the room. This avoids wasted work and lets a survivor take over once the dead
+//     owner's lease lapses, rebuilding state from the log.
+//   - Hard: the durable log's conditional Append (logstore.ErrConflict) still fails a write
+//     from a stale owner even if the lease is briefly wrong — the backstop against split-brain.
+//
+// Lease renewal here is "claim-on-serve": each Commit/Join renews the lease, so a busy room
+// stays owned and a quiet one's lease lapses (acceptable — the log is the truth; whoever next
+// touches the room re-homes it). A background renewal loop (keeping quiet rooms pinned, reading
+// a monotonic clock per the coord package note) is layered on later.
 package roomruntime
 
 import (
 	"context"
+	"errors"
 	"sync"
+	"time"
 
 	aetherv1 "github.com/SamarthParnami/aether/go/gen/aether/v1"
+	"github.com/SamarthParnami/aether/go/internal/coord"
 	"github.com/SamarthParnami/aether/go/internal/fanout"
 	"github.com/SamarthParnami/aether/go/internal/logstore"
 	"github.com/SamarthParnami/aether/go/internal/roomcore"
 )
 
-// Runtime owns a set of rooms on this node. (Coordination/ownership is layered on later;
-// for now a Runtime is assumed to be the sole owner of any room it serves.)
+// defaultLeaseTTL is the lease lifetime used when WithLeaseTTL is not supplied. It must be
+// comfortably larger than the (later) renewal interval and the max inter-node clock skew.
+const defaultLeaseTTL = 10 * time.Second
+
+// ErrNotOwner is returned by Commit/Join when this node does not hold the room's ownership
+// lease — another node is the live owner. The caller (gateway) should route to the real owner
+// or retry after the lease lapses; it must not treat the operation as applied.
+var ErrNotOwner = errors.New("roomruntime: not the room owner")
+
+// Runtime owns a set of rooms on this node. Ownership is enforced per room via the coord
+// lease; a Runtime serves only rooms whose lease it currently holds.
 type Runtime struct {
+	nodeID string
 	log    logstore.LogStore
 	fanout fanout.Fanout
+	coord  coord.Coordinator
+	now    func() time.Time
+	ttl    time.Duration
 
 	// A single Runtime-wide mutex serializes all rooms, and is held across the durable append
 	// — a deliberate single-node Phase-1 simplification. Per-room serialization (a per-room
@@ -32,17 +61,49 @@ type Runtime struct {
 	rooms map[string]*roomcore.Room
 }
 
-// New returns a Runtime backed by the given log and fan-out bus.
-func New(log logstore.LogStore, fo fanout.Fanout) *Runtime {
-	return &Runtime{log: log, fanout: fo, rooms: map[string]*roomcore.Room{}}
+// Option configures a Runtime. Unset options fall back to single-node defaults: a private
+// in-memory coordinator, node id "local", the wall clock, and defaultLeaseTTL.
+type Option func(*Runtime)
+
+// WithNodeID sets this node's lease-owner identity. Each node in a cluster needs a distinct id.
+func WithNodeID(id string) Option { return func(r *Runtime) { r.nodeID = id } }
+
+// WithCoordinator injects the shared ownership coordinator. Nodes that can contend for the
+// same room must share one coordinator (in prod, the DynamoDB-backed impl).
+func WithCoordinator(co coord.Coordinator) Option { return func(r *Runtime) { r.coord = co } }
+
+// WithClock injects the clock used to drive lease expiry. Defaults to time.Now; tests pass a
+// virtual clock so failover timing is deterministic.
+func WithClock(now func() time.Time) Option { return func(r *Runtime) { r.now = now } }
+
+// WithLeaseTTL sets the lease lifetime acquired on each claim/renew.
+func WithLeaseTTL(ttl time.Duration) Option { return func(r *Runtime) { r.ttl = ttl } }
+
+// New returns a Runtime backed by the given log and fan-out bus. Without options it is a
+// self-contained single-node owner (private coordinator) — every room it touches is its own.
+func New(log logstore.LogStore, fo fanout.Fanout, opts ...Option) *Runtime {
+	r := &Runtime{
+		nodeID: "local",
+		log:    log,
+		fanout: fo,
+		coord:  coord.NewMemory(),
+		now:    time.Now,
+		ttl:    defaultLeaseTTL,
+		rooms:  map[string]*roomcore.Room{},
+	}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
 }
 
 // Commit processes a durable commit and returns the committed Event.
 //
 //   - applied:  a new commit — assigned room_seq, persisted, and fanned out (event != nil).
 //   - !applied: a duplicate (replayed) commit — ignored, exactly-once (event == nil, err == nil).
-//   - err:      persistence failed; on a sequence conflict the in-memory room is dropped so
-//     it rebuilds from the log (a conflict means this node is not really the owner).
+//   - err:      ErrNotOwner if this node does not hold the room lease; otherwise persistence
+//     failed. On a sequence conflict the in-memory room is dropped so it rebuilds from the log
+//     (a conflict means this node is not really the owner).
 func (r *Runtime) Commit(
 	ctx context.Context, roomID, clientID string, clientSeq uint64, body *aetherv1.EventBody,
 ) (*aetherv1.Event, bool, error) {
@@ -64,6 +125,9 @@ func (r *Runtime) commitLocked(
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if err := r.acquire(roomID); err != nil {
+		return nil, false, err
+	}
 	room, err := r.ensureRoom(ctx, roomID)
 	if err != nil {
 		return nil, false, err
@@ -89,6 +153,9 @@ func (r *Runtime) Join(ctx context.Context, roomID string) (*aetherv1.Joined, er
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if err := r.acquire(roomID); err != nil {
+		return nil, err
+	}
 	room, err := r.ensureRoom(ctx, roomID)
 	if err != nil {
 		return nil, err
@@ -102,6 +169,27 @@ func (r *Runtime) Join(ctx context.Context, roomID string) (*aetherv1.Joined, er
 		CurrentSeq: snap.RoomSeq,
 		Snapshot:   &aetherv1.Snapshot{RoomSeq: snap.RoomSeq, State: snap.State},
 	}, nil
+}
+
+// Release gracefully relinquishes ownership of a room (e.g. on a planned shutdown) so a
+// survivor can take over immediately instead of waiting out the lease TTL. The in-memory room
+// is dropped; a later request re-homes it (re-claiming if the room is still free).
+func (r *Runtime) Release(roomID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.coord.Release(roomID, r.nodeID)
+	delete(r.rooms, roomID)
+}
+
+// acquire confirms this node holds the room's ownership lease, claiming it if the room is free
+// or expired and renewing it if already held. On failure another node is the live owner: the
+// stale in-memory room is dropped and ErrNotOwner returned. Caller must hold r.mu.
+func (r *Runtime) acquire(roomID string) error {
+	if _, ok := r.coord.Claim(roomID, r.nodeID, r.now(), r.ttl); !ok {
+		delete(r.rooms, roomID) // we no longer own it; don't serve from a stale copy
+		return ErrNotOwner
+	}
+	return nil
 }
 
 // ensureRoom returns the in-memory room, rebuilding it from the durable log on first access.
