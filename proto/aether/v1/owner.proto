@@ -48,13 +48,22 @@ message CommitRequest {
   EventBody body = 4;
 }
 
-// CommitResponse reports the durable outcome: the committed Event (for reference) or a Nack.
+// CommitResponse reports the durable outcome of a commit — mirroring Runtime.Commit's THREE
+// results: applied, rejected, or an exactly-once duplicate.
 message CommitResponse {
   oneof outcome {
-    Event committed = 1; // persisted (also fanned back to the client)
+    Event committed = 1; // newly persisted (also fanned back to the client)
     Nack nack = 2; // application-level rejection (permission / invalid / rate-limited / ...)
+    DuplicateAck duplicate = 3; // (client_id, client_seq) already applied — dedup no-op
   }
 }
+
+// DuplicateAck confirms a commit whose (client_id, client_seq) was already applied — the
+// exactly-once path a lost-ack resubmit hits (owner persisted, then died before the gateway saw
+// the response; the SDK resubmits). The owner does NOT re-fan the original Event, so the gateway
+// uses this to complete the client's in-flight commit; the Event itself reaches the client via its
+// Subscribe replay. Empty for now — may carry the original room_seq later if cheap to surface.
+message DuplicateAck {}
 
 message GetSnapshotRequest {
   string room_id = 1;
