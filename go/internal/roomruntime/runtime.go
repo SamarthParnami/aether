@@ -70,7 +70,10 @@ type Option func(*Runtime)
 func WithNodeID(id string) Option { return func(r *Runtime) { r.nodeID = id } }
 
 // WithAddr sets this node's dialable RPC address, published into the lease on each claim so the
-// directory can route gateways to the owner. Defaults to "" (single-node / tests don't route).
+// directory can route gateways to the owner. Defaults to "" (single-node / tests don't route): an
+// empty addr is a deliberately NON-routable owner, so the gateway's router must treat an empty
+// Lease.Addr as "no owner" and re-resolve, turning a misconfigured node (forgot WithAddr) into a
+// fast re-resolve rather than a silent black hole.
 func WithAddr(addr string) Option { return func(r *Runtime) { r.addr = addr } }
 
 // WithCoordinator injects the shared ownership coordinator. Nodes that can contend for the
