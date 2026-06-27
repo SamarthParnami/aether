@@ -5,6 +5,10 @@ plugins:
   - remote: buf.build/protocolbuffers/go
     out: go/gen
     opt: paths=source_relative
+  # Connect-Go service stubs (gateway↔owner RPC; Go-only — clients speak the WS envelope, not RPC)
+  - remote: buf.build/connectrpc/go
+    out: go/gen
+    opt: paths=source_relative
   # TypeScript types → imported by @aether/protocol (gitignored, built in CI + `task proto:gen`)
   - remote: buf.build/bufbuild/es
     out: packages/protocol/src/gen
