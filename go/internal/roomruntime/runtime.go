@@ -149,6 +149,14 @@ func (r *Runtime) commitLocked(
 // Join returns the room's current materialized state for catch-up: the latest room_seq and a
 // snapshot a joining client adopts before applying any newer events. (Client-id assignment
 // and the gap replay belong to the gateway/SDK, layered on later.)
+//
+// Join takes the ownership lease exactly like a write (claim-on-serve: a node can only
+// materialize a room it owns). Two consequences for the caller: a gateway MUST route Join to
+// the room's current owner (coord.Current) and never fan a join to an arbitrary node, or an
+// idle bystander would seize ownership just by being asked to read; and concurrent joins to a
+// quiet (unowned) room can briefly bounce ownership — each re-claims, the loser gets
+// ErrNotOwner and retries. Acceptable for Phase 1; the gateway's owner-routing makes it a
+// non-issue in practice.
 func (r *Runtime) Join(ctx context.Context, roomID string) (*aetherv1.Joined, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -184,6 +192,13 @@ func (r *Runtime) Release(roomID string) {
 // acquire confirms this node holds the room's ownership lease, claiming it if the room is free
 // or expired and renewing it if already held. On failure another node is the live owner: the
 // stale in-memory room is dropped and ErrNotOwner returned. Caller must hold r.mu.
+//
+// The granted Lease (and its fencing Token) is intentionally discarded: in Phase 1 the only
+// thing fenced is the durable write, and that is fenced by the room_seq conditional Append, not
+// the token — so the token is not load-bearing here. The token's eventual job is fencing the
+// one durable write NOT conditioned on room_seq, logstore.WriteSnapshot (today an unconditional
+// overwrite), so a zombie owner can't clobber a fresher snapshot with a stale one. We thread
+// the token into snapshot writes when snapshots are added.
 func (r *Runtime) acquire(roomID string) error {
 	if _, ok := r.coord.Claim(roomID, r.nodeID, r.now(), r.ttl); !ok {
 		delete(r.rooms, roomID) // we no longer own it; don't serve from a stale copy
