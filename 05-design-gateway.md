@@ -54,9 +54,13 @@ reconnect and recover.
   here, remote for a room owned elsewhere. The seam to split into separate gateway/owner tiers
   later is preserved (it's just an address).
 - **The directory.** When an owner claims a room it must be *dialable*. `coord` today returns
-  `Lease.Owner` (a node id) for fencing; the gateway also needs an **address**. We add a node-id →
-  RPC-address resolution (either an `Addr` on the lease/directory, or a small membership registry).
-  `coord.Current(room)` → `(ownerNodeID, addr)` is what the router uses.
+  `Lease.Owner` (a node id) for fencing; the gateway also needs an **address**. We put `Addr` on the
+  lease so a `Claim` **atomically publishes ownership and dialability in one conditional write** —
+  there is never an "owns-but-not-dialable" window. (A separate node-id→addr registry would race the
+  lease: `coord.Current` could name an owner whose address is stale (it died) or not-yet-registered
+  (it just claimed), forcing the gateway to resolve an owner it can't dial — on the hottest path,
+  since every Join/Commit resolves.) `coord.Current(room)` → `(ownerNodeID, addr, token)` is what the
+  router uses; the lease stays the single source of "who owns this *and where to reach them*."
 - **Connection pooling.** The gateway keeps a pooled RPC client per owner address; invalidated on
   failover / dial errors.
 
@@ -89,9 +93,21 @@ service RoomService {
   `Event` is *not* returned as the success payload that the client waits on — **fan-out is the
   ack**: the event arrives at the client via its `Subscribe` stream (matched by
   `origin_client_seq`). The unary response just tells the gateway "persisted / rejected / not-owner".
-- `Subscribe(room_id, from_seq)` is the heart of the relay. Implementation note: the owner must
-  attach to `fanout` **before** reading the log up to head, then dedupe the overlap by `room_seq`,
-  so the live tail can't slip through the gap between replay and subscription.
+- `Subscribe(room_id, from_seq)` is the heart of the relay. It MUST deliver **every event in strict
+  `room_seq` order, gap-free, starting at `from_seq+1`** — history from the log, the live tail from
+  `fanout`, and the log used to *repair* fanout. The owner publishes outside the commit lock (see
+  roomruntime #17), so concurrent commits can hand fanout seq 6 before seq 5. The bridge therefore
+  tracks a per-stream `next` cursor and forwards only `room_seq == next`: on a fanout event with
+  `seq > next` it reads `[next .. seq-1]` from the log to fill the gap; on `seq < next` it drops the
+  duplicate. (It attaches to `fanout` **before** reading history so nothing slips through the
+  replay→live seam.) In-order, gap-free live delivery is an explicit **G2 requirement**, not an
+  emergent property — otherwise a client sees a phantom gap and triggers a spurious resync.
+- **Deep resume.** If `from_seq` is older than the log floor (once snapshots/compaction land — not
+  yet, but the contract must exist first), `Subscribe` returns `FROM_SEQ_TOO_OLD`; the gateway falls
+  back to `GetSnapshot` → `Subscribe(snapshotSeq)`. That is the **deep resume** the envelope's
+  `Joined.snapshot` field was reserved for (vs a **shallow resume** that's pure cursor catch-up).
+  Defining it now so G6/G9 and the snapshot PR share one log-floor contract instead of inventing it
+  independently.
 - `GetSnapshot(room_id)` → `(room_seq, RoomState)` for the initial state on a fresh join.
 
 Why a stream per (gateway, room) rather than Redis pub/sub? Phase-1 `fanout` is in-memory and
@@ -105,14 +121,16 @@ events because the durable log + recovery fills any gap.
 1. **Open + auth.** Client dials the WS. The gateway runs the `Authenticator` (stub: trust a dev
    token/header) → an authenticated principal. Connection state: the set of joined rooms + their
    live subscriptions.
-2. **Join.** `Join{room_id, from_seq, client_id?}` →
-   - *fresh* (`from_seq=0`, no `client_id`): gateway **assigns a `client_id`**, `GetSnapshot` →
-     send `Joined{client_id, current_seq=S, snapshot}`, then `Subscribe(room, from_seq=S)` and relay
-     `Event`s `S+1…` as they arrive.
-   - *resume* (`from_seq>0`, prior `client_id`): validate the `client_id` belongs to this principal,
-     send `Joined{client_id, current_seq}` (snapshot omitted on a shallow resume), `Subscribe(room,
-     from_seq)` → the owner replays `from_seq+1…head` from the log then goes live. No snapshot, no
-     reload — pure cursor catch-up.
+2. **Join.** `Join{room_id, from_seq, session_nonce}` → the gateway authenticates the connection to a
+   principal and **derives `client_id` deterministically from principal + nonce** (§5), so any
+   gateway computes the same id with zero shared state.
+   - *fresh* (`from_seq=0`): `GetSnapshot` → send `Joined{client_id, current_seq=S, snapshot}`, then
+     `Subscribe(room, S)` and relay `Event`s `S+1…`.
+   - *shallow resume* (`from_seq>0`, still above the log floor): send `Joined{client_id,
+     current_seq}` (snapshot omitted), `Subscribe(room, from_seq)` → owner replays `from_seq+1…head`
+     then goes live. No snapshot, no reload — pure cursor catch-up.
+   - *deep resume* (`from_seq` below the log floor): `Subscribe` answers `FROM_SEQ_TOO_OLD` → gateway
+     does `GetSnapshot` → `Joined{client_id, current_seq=S, snapshot}` → `Subscribe(S)`.
 3. **Commit.** `Commit{room_id, client_seq, body}` → enforce the client has joined the room (else
    `Nack{NOT_JOINED}`) → `RoomService.Commit`. On `Nack`, forward it. On not-owner, re-resolve and
    retry (§6). Success is silent here — the `Event` returns via the subscription.
@@ -131,11 +149,20 @@ realized end to end:
 - The SDK holds **one** WS. On any drop it reconnects and sends `Join{from_seq=lastSeq,
   client_id=<its id>}` per room. The `Subscribe(from_seq)` replay closes the gap idempotently
   (events are keyed by `room_seq`; re-applying a seen one is a no-op).
-- **Stable identity across reconnects.** Dedup is `(client_id, client_seq)`; exactly-once across a
-  reconnect requires the client to keep the *same* `client_id` and continue its `client_seq`. So the
-  `client_id` must round-trip. **Contract addition (non-breaking):** add `string client_id = 3;` to
-  `Join` (proto3 field addition passes `buf breaking`). Server assigns on first join; client echoes
-  it on resume.
+- **Stable identity across reconnects — with a *stateless* gateway.** Dedup is `(client_id,
+  client_seq)`; exactly-once across a reconnect requires the *same* `client_id`. But the SDK may
+  reconnect to a **different** gateway that has never seen it, and §1 forbids per-connection durable
+  state — so the id can't be a server assignment looked up from a shared store. Instead the SDK
+  generates a random **`session_nonce`** once per session (persists it across reconnects) and sends
+  it on every `Join`; the gateway derives `client_id = derive(principal, session_nonce)` — e.g. an
+  HMAC under a cluster secret — so **any gateway re-derives the same id from the authenticated
+  principal with zero shared state**. Because the principal is authenticated on every connect and is
+  baked into the id, a client can only mint ids within its *own* identity — it cannot forge another
+  client's id to poison that client's `(client_id, client_seq)` dedup space. The server returns the
+  derived id in `Joined.client_id` (the SDK needs it to match the fanned-back ack). **Contract
+  addition (non-breaking):** add `string session_nonce = 3;` to `Join` (proto3 field-add passes `buf
+  breaking`). This is the concrete mechanism behind §8's "`Authenticate` returns any pre-bound
+  `client_id`."
 - **Ack-after-persist** is preserved: a `Commit`'s `Event` only ever reaches the client *after* the
   owner durably appended it, because the event is sourced from the same fan-out the durable write
   triggers.
@@ -152,12 +179,22 @@ realized end to end:
   errors; the gateway re-resolves and re-subscribes to the new owner `from_seq=lastDelivered` — no
   client-visible gap.
 
-## 7. FROZEN / LIVE (`RoomStatus`)
+## 7. FROZEN / LIVE (`RoomStatus`) — and a commit's terminal outcome during a freeze
 
-When durable commits can't proceed (quorum loss / re-homing in progress — no resolvable owner), the
-gateway sends `RoomStatus{FROZEN}` to affected clients; the SDK pauses commits (buffers locally).
-Once an owner is resolvable again, `RoomStatus{LIVE}`. Phase-1 trigger: `coord.Current` returns no
-live owner *and* a claim hasn't yet succeeded; cleared on the next successful resolve.
+When durable commits can't proceed (quorum loss / re-homing — no resolvable owner), the gateway
+sends `RoomStatus{FROZEN}` to affected clients; once an owner resolves again, `RoomStatus{LIVE}`.
+Phase-1 trigger: `coord.Current` returns no live owner *and* a claim hasn't yet succeeded; cleared on
+the next successful resolve.
+
+**Reconciling with §6's retry — the gateway never buffers a durable commit.** §1 keeps the gateway
+stateless, so it must not hold in-flight commits (they'd be lost if it died, breaking the recovery
+contract). So a commit that can't resolve an owner gets a *short* bounded retry to ride out a quick
+re-home; if the freeze outlasts it, the gateway emits `RoomStatus{FROZEN}` and **`Nack`s the commit
+with a transient reason** — the **SDK owns the buffer** and re-submits the same `(client_id,
+client_seq)` once it sees `LIVE` (idempotent: if it had somehow persisted, dedup rejects the
+re-submit). This needs a **contract addition (non-breaking):** `NACK_REASON_UNAVAILABLE = 6;`, so the
+client distinguishes a transient freeze (retry on `LIVE`) from a permanent rejection (`INVALID`,
+`PERMISSION_DENIED`). A commit can no longer fall between §6 and §7.
 
 ## 8. Auth (pluggable)
 
@@ -168,9 +205,10 @@ type Authenticator interface {
 }
 ```
 
-Phase-1 impl trusts a dev token/header and derives a principal; `client_id` assignment lives in the
-gateway. Real JWT verification against Uprio auth slots in behind this interface at app integration
-— no transport changes.
+Phase-1 impl trusts a dev token/header and derives a principal; `client_id` is then **derived** from
+that principal + the Join's `session_nonce` (§5), never assigned from server-side state. Real JWT
+verification against Uprio auth slots in behind this interface at app integration — no transport
+changes.
 
 ## 9. Liveness & backpressure
 
@@ -202,15 +240,15 @@ before stacking the next where there's a dependency.
 | # | PR | Scope | Depends on |
 |---|----|-------|-----------|
 | G1 | **owner RPC contract** | `owner.proto` `RoomService` + Connect-Go plugin in `buf.gen.yaml` + codegen wiring. No impl. `buf breaking` stays green (additive). | — |
-| G2 | **owner RPC server** | Adapter wrapping `roomruntime.Runtime`: Commit / GetSnapshot / Broadcast handlers + the Subscribe replay-then-live bridge. In-process Connect tests. | G1 |
-| G3 | **owner directory address** | Resolve owner node-id → RPC addr (add `Addr` to the directory or a membership registry); `coord.Current` usable for routing. | G1 |
+| G2 | **owner RPC server** | Adapter wrapping `roomruntime.Runtime`: Commit / GetSnapshot / Broadcast + the Subscribe bridge with **strict in-order, gap-free `room_seq` delivery** (log-repairs fanout reorder). In-process Connect tests. | G1 |
+| G3 | **owner directory address** | Add `Addr` to `coord.Lease` so `Claim` atomically publishes ownership + dialability; `coord.Current` → `(owner, addr, token)` for routing. | — |
 | G4 | **owner RPC client + locator** | Gateway-side `OwnerClient` (pooled) + `OwnerLocator` (room → owner via G3). Tested against G2's in-process server. | G2, G3 |
 | G5 | **WS transport skeleton** | coder/websocket accept loop, `Authenticator` stub, protobuf frame read/write, Ping/Pong, clean teardown. No room logic. | — |
 | G6 | **Join (fresh) + relay** | `Join{from_seq=0}` → GetSnapshot → assign `client_id` → `Joined`; Subscribe → relay live `Event`s. | G4, G5 |
 | G7 | **Commit + Nack** | `Commit` → owner; fan-out-is-the-ack; failures → `Nack`; enforce `NOT_JOINED`. | G6 |
 | G8 | **Broadcast (ephemeral)** | `Broadcast` → owner → `Ephemeral` relay. | G6 |
-| G9 | **Resume / recovery** | additive `Join.client_id`; `Join{from_seq>0}` replay-then-live; stable id + dedup continuity across reconnect. | G7 |
-| G10 | **RoomStatus + routing under failover** | FROZEN/LIVE; re-resolve on not-owner; re-subscribe on stream failover. | G7 |
+| G9 | **Resume / recovery** | additive `Join.session_nonce` + derived `client_id`; shallow resume (`from_seq>0` replay-then-live); stable id + dedup continuity across reconnect. (Deep-resume `FROM_SEQ_TOO_OLD` fallback lands with the snapshot/compaction PR.) | G7 |
+| G10 | **RoomStatus + routing under failover** | FROZEN/LIVE; additive `NACK_REASON_UNAVAILABLE`; gateway never buffers (short retry → FROZEN + transient Nack, SDK re-submits on LIVE); re-resolve on not-owner; re-subscribe on stream failover. | G7 |
 | G11 | **full client↔gateway↔owner DST** | extend the sim matrix to both networks + routing (the Phase-1 exit chaos suite). | G9, G10 |
 
 After G11: minimal node binary (`cmd/aether-node`) wiring it together, then the **TS SDK**
@@ -218,8 +256,10 @@ After G11: minimal node binary (`cmd/aether-node`) wiring it together, then the 
 
 ## 12. Open questions / deferred
 
-- **Directory address** (G3): extend `coord.Lease` with `Addr`, or a separate membership registry?
-  Leaning registry, so the lease stays a pure fencing primitive — to confirm at G3.
+- **Directory address** (G3): **resolved → `Addr` on `coord.Lease`** (atomic publish on claim), not a
+  separate registry. A registry races the lease (an "owns-but-not-dialable" window on the hottest
+  path — every Join/Commit resolves); atomic ownership+address in one conditional write wins over the
+  "pure fencing primitive" elegance.
 - **Redis fan-out**: deferred; Subscribe-stream relay first, Redis behind the same abstraction when
   gateway↔owner stream count becomes a scale concern.
 - **Admin override** (`NACK_REASON_OVERRIDDEN`) and **presence**: Phase 2 features; the contract
