@@ -81,14 +81,20 @@ func (s *Server) Subscribe(
 	err := s.rt.Tail(ctx, m.GetRoomId(), m.GetFromSeq(), func(ev *aetherv1.Event) error {
 		return stream.Send(&aetherv1.SubscribeResponse{Event: ev})
 	})
-	switch {
-	case errors.Is(err, context.Canceled):
-		return nil // the client closed the stream (or the server is shutting down) — a clean end
-	case errors.Is(err, roomruntime.ErrNotOwner):
-		return connect.NewError(connect.CodeFailedPrecondition, err)
-	default:
-		return err // a send failure or other error; nil ends the stream normally
+
+	// A cancelled context means the client (or the server) is gone — a clean end, regardless of
+	// whether the cancel surfaced from Tail's own select or as a stream.Send failure mid-disconnect.
+	// Check ctx, not the error kind, so routine watcher churn isn't recorded as failed streams.
+	if ctx.Err() != nil {
+		return nil
 	}
+	if errors.Is(err, roomruntime.ErrNotOwner) {
+		return connect.NewError(connect.CodeFailedPrecondition, err)
+	}
+	// TODO(compaction): when Tail gains a log-floor check, map its "from_seq too old" sentinel to
+	// connect.CodeOutOfRange here, so the gateway's deep-resume fallback (GetSnapshot + Subscribe
+	// from the snapshot seq) triggers — the G1 contract already declares OUT_OF_RANGE for it.
+	return err // a real mid-stream Send/read failure (or nil)
 }
 
 // Broadcast (the ephemeral tier) is not wired yet — it needs an ephemeral delivery path on the
