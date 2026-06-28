@@ -99,8 +99,15 @@ func WithLeaseTTL(ttl time.Duration) Option { return func(r *Runtime) { r.ttl = 
 
 // WithTailPollInterval sets how often Tail re-reads the log absent a fan-out wakeup — the bound on
 // read staleness when the room is served by a node that isn't being woken (e.g. after a re-home).
-// Defaults to defaultTailPollInterval.
-func WithTailPollInterval(d time.Duration) Option { return func(r *Runtime) { r.tailPoll = d } }
+// Defaults to defaultTailPollInterval. A non-positive d is IGNORED: the poll is the correctness
+// floor and must not be disabled, and time.NewTicker would panic on it.
+func WithTailPollInterval(d time.Duration) Option {
+	return func(r *Runtime) {
+		if d > 0 {
+			r.tailPoll = d
+		}
+	}
+}
 
 // New returns a Runtime backed by the given log and fan-out bus. Without options it is a
 // self-contained single-node owner (private coordinator) — every room it touches is its own.

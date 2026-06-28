@@ -175,6 +175,27 @@ func TestTailPollSurvivesReHome(t *testing.T) {
 	}
 }
 
+// A non-positive poll interval is ignored (the floor can't be disabled, and would otherwise panic
+// time.NewTicker) — the stream still works via the wake/catch-up path.
+func TestTailPollIntervalNonPositiveIsSafe(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rt := roomruntime.New(logstore.NewMemory(), fanout.NewMemory(),
+		roomruntime.WithTailPollInterval(0)) // would panic NewTicker if not clamped
+	rt.Commit(ctx, "room", "A", 1, kvBody("k", "v"))
+
+	got := make(chan uint64, 4)
+	go func() {
+		_ = rt.Tail(ctx, "room", 0, func(ev *aetherv1.Event) error {
+			got <- ev.GetRoomSeq()
+			return nil
+		})
+	}()
+	if s := recvSeq(t, got); s != 1 {
+		t.Fatalf("delivered %d, want 1", s)
+	}
+}
+
 // A send error ends the tail and is returned to the caller (the RPC handler ends the stream).
 func TestTailStopsOnSendError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())

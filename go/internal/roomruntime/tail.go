@@ -75,7 +75,10 @@ func (r *Runtime) Tail(
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-wake:
-			// a commit on this node fired its fan-out — read everything new from the log
+			// A commit on this node fired its fan-out — read everything new, and push the poll out:
+			// the backstop should only fire after tailPoll of actual silence, so a healthy
+			// (wake-fed) stream does ~zero empty log reads. Only this goroutine touches the ticker.
+			ticker.Reset(r.tailPoll)
 		case <-ticker.C:
 			// poll fallback — pick up another node's writes (after a re-home) or any missed wake
 		}
