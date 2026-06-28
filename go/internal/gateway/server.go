@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"connectrpc.com/connect"
 	"github.com/coder/websocket"
 	"google.golang.org/protobuf/proto"
 
@@ -28,20 +29,41 @@ const (
 	pingTimeout   = 10 * time.Second
 )
 
-// Server is an http.Handler that upgrades requests to the Aether client WebSocket.
+// defaultClientIDSecret is a DEV-ONLY HMAC key for client_id derivation. Production must inject a
+// real cluster-wide secret via WithClientIDSecret — every gateway must share it so a reconnect to
+// any gateway derives the same id.
+var defaultClientIDSecret = []byte("aether-dev-client-id-secret")
+
+// Server is an http.Handler that upgrades requests to the Aether client WebSocket and serves the
+// room protocol against owners resolved through the locator.
 type Server struct {
-	auth Authenticator
+	auth    Authenticator
+	locator *OwnerLocator
+	secret  []byte // HMAC key for client_id derivation (cluster-wide)
 }
 
-// NewServer returns a gateway WebSocket server that authenticates handshakes with auth.
-func NewServer(auth Authenticator) *Server {
-	return &Server{auth: auth}
+// ServerOption configures a Server.
+type ServerOption func(*Server)
+
+// WithClientIDSecret sets the cluster-wide HMAC key used to derive client_ids. All gateways MUST
+// share it so a client's id (and thus its dedup identity) is stable across reconnects to any
+// gateway. Defaults to a dev-only key.
+func WithClientIDSecret(secret []byte) ServerOption { return func(s *Server) { s.secret = secret } }
+
+// NewServer returns a gateway WebSocket server: it authenticates handshakes with auth and routes
+// room traffic to owners via locator.
+func NewServer(auth Authenticator, locator *OwnerLocator, opts ...ServerOption) *Server {
+	s := &Server{auth: auth, locator: locator, secret: defaultClientIDSecret}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // ServeHTTP authenticates the handshake, upgrades to a WebSocket, and serves the connection.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Principal will seed client_id derivation in a later PR; here it only gates access.
-	if _, err := s.auth.Authenticate(r.Context(), r); err != nil {
+	principal, err := s.auth.Authenticate(r.Context(), r)
+	if err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -50,7 +72,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return // Accept already wrote the failure response
 	}
-	(&conn{ws: ws, out: make(chan *aetherv1.ServerMessage, outQueue)}).run(r.Context())
+	(&conn{
+		srv:       s,
+		principal: principal,
+		ws:        ws,
+		out:       make(chan *aetherv1.ServerMessage, outQueue),
+	}).run(r.Context())
 }
 
 // conn is one client WebSocket: a read loop decoding ClientMessage frames, a single writer
@@ -58,9 +85,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // keepalive. All three share a context that any one cancels on exit, so the whole connection tears
 // down together instead of leaking a goroutine, the socket, or the TCP conn.
 type conn struct {
-	ws     *websocket.Conn
-	out    chan *aetherv1.ServerMessage
-	cancel context.CancelFunc
+	srv       *Server
+	principal Principal
+	ws        *websocket.Conn
+	out       chan *aetherv1.ServerMessage
+	cancel    context.CancelFunc
 }
 
 func (c *conn) run(ctx context.Context) {
@@ -99,24 +128,53 @@ func (c *conn) readLoop(ctx context.Context) {
 			c.send(errorFrame("INVALID", "malformed ClientMessage"))
 			continue
 		}
-		c.dispatch(&m)
+		c.dispatch(ctx, &m)
 	}
 }
 
-// dispatch handles one decoded frame. The skeleton answers Ping; room frames are UNIMPLEMENTED
-// until their PRs wire the owner RPC.
-func (c *conn) dispatch(m *aetherv1.ClientMessage) {
+// dispatch handles one decoded frame. Join is served now; the remaining room frames are
+// UNIMPLEMENTED until their PRs wire the owner RPC.
+func (c *conn) dispatch(ctx context.Context, m *aetherv1.ClientMessage) {
 	switch b := m.GetBody().(type) {
 	case *aetherv1.ClientMessage_Ping:
 		c.send(&aetherv1.ServerMessage{
 			Body: &aetherv1.ServerMessage_Pong{Pong: &aetherv1.Pong{Id: b.Ping.GetId()}},
 		})
-	case *aetherv1.ClientMessage_Join, *aetherv1.ClientMessage_Commit,
-		*aetherv1.ClientMessage_Broadcast, *aetherv1.ClientMessage_Leave:
+	case *aetherv1.ClientMessage_Join:
+		c.handleJoin(ctx, b.Join)
+	case *aetherv1.ClientMessage_Commit, *aetherv1.ClientMessage_Broadcast, *aetherv1.ClientMessage_Leave:
 		c.send(errorFrame("UNIMPLEMENTED", "room handling lands in a later gateway PR"))
 	default:
 		c.send(errorFrame("INVALID", "empty or unknown frame"))
 	}
+}
+
+// handleJoin serves a fresh Join: derive the client's stable id, resolve the room's owner, fetch
+// the current snapshot, and reply Joined. (Live event relay and resume catch-up land next, in
+// G6b/G9; FROZEN/retry on no-owner lands with routing, G10.)
+func (c *conn) handleJoin(ctx context.Context, join *aetherv1.Join) {
+	clientID := deriveClientID(c.srv.secret, c.principal.ID, join.GetSessionNonce())
+
+	owner, _, err := c.srv.locator.Owner(join.GetRoomId())
+	if err != nil {
+		c.send(errorFrame("UNAVAILABLE", "room has no reachable owner"))
+		return
+	}
+
+	resp, err := owner.GetSnapshot(ctx, connect.NewRequest(&aetherv1.GetSnapshotRequest{
+		RoomId: join.GetRoomId(),
+	}))
+	if err != nil {
+		c.send(errorFrame("UNAVAILABLE", "could not fetch room snapshot"))
+		return
+	}
+
+	c.send(&aetherv1.ServerMessage{Body: &aetherv1.ServerMessage_Joined{Joined: &aetherv1.Joined{
+		RoomId:     join.GetRoomId(),
+		ClientId:   clientID,
+		CurrentSeq: resp.Msg.GetRoomSeq(),
+		Snapshot:   &aetherv1.Snapshot{RoomSeq: resp.Msg.GetRoomSeq(), State: resp.Msg.GetState()},
+	}}})
 }
 
 // writeLoop is the sole writer: it drains the outbound queue to the socket.

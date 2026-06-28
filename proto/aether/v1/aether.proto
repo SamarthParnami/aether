@@ -45,6 +45,11 @@ message ServerMessage {
 message Join {
   string room_id = 1;
   uint64 from_seq = 2; // 0 = fresh (server sends a Snapshot); >0 = resume from this cursor
+  // session_nonce: a random value the SDK generates once per session and persists across
+  // reconnects. The gateway derives a stable client_id = HMAC(cluster_secret, principal+nonce),
+  // so any (stateless) gateway re-derives the same id with zero shared state, and a client can
+  // only mint ids within its own authenticated principal. See 05-design-gateway.md §5.
+  string session_nonce = 3;
 }
 
 message Commit {
