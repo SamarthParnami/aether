@@ -52,28 +52,33 @@ func TestBroadcastEchoesAsEphemeral(t *testing.T) {
 	}
 	clientID := joined.GetClientId()
 
-	bcast := &aetherv1.ClientMessage{Body: &aetherv1.ClientMessage_Broadcast{Broadcast: &aetherv1.Broadcast{
+	// Ephemeral delivery is live-only and the relay subscribes asynchronously after Join, so keep
+	// broadcasting (concurrently, throttled) until one echoes back. The broadcaster uses a raw write
+	// off the test goroutine (no t.Fatal there) and ignores errors during teardown; the test goroutine
+	// does a blocking read on the outer ctx — never a short per-read timeout, which would close the WS.
+	bcast, err := proto.Marshal(&aetherv1.ClientMessage{Body: &aetherv1.ClientMessage_Broadcast{Broadcast: &aetherv1.Broadcast{
 		RoomId: "room", Body: ephBody("cursor", "10,20"),
-	}}}
-	for {
-		writeFrame(ctx, t, ws, bcast)
-
-		rctx, rcancel := context.WithTimeout(ctx, 150*time.Millisecond)
-		typ, data, err := ws.Read(rctx)
-		rcancel()
-		if err != nil {
-			if ctx.Err() != nil {
-				t.Fatal("timed out waiting for the broadcast to echo as an ephemeral")
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		tick := time.NewTicker(20 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-tick.C:
+				_ = ws.Write(context.Background(), websocket.MessageBinary, bcast)
 			}
-			continue // relay not subscribed yet — re-broadcast
 		}
-		if typ != websocket.MessageBinary {
-			continue
-		}
-		var m aetherv1.ServerMessage
-		if err := proto.Unmarshal(data, &m); err != nil {
-			t.Fatal(err)
-		}
+	}()
+
+	for {
+		m := readFrame(ctx, t, ws)
 		if e := m.GetEphemeral(); e != nil {
 			if e.GetOriginClientId() != clientID {
 				t.Fatalf("ephemeral origin = %q, want %q", e.GetOriginClientId(), clientID)
@@ -83,7 +88,7 @@ func TestBroadcastEchoesAsEphemeral(t *testing.T) {
 			}
 			return
 		}
-		// any other frame (e.g. a stray Event) — keep trying
+		// any other frame (e.g. a stray Event) — keep reading
 	}
 }
 

@@ -169,15 +169,21 @@ func (c *conn) readLoop(ctx context.Context) {
 	}
 }
 
-// enqueue hands a decoded room frame to the ops worker. A full queue means the client is issuing
-// ops faster than the owner can absorb them, so we disconnect it (per design §9; it resumes from
-// lastSeq on reconnect) rather than blocking the read loop and starving WS keepalive.
+// enqueue hands a decoded room frame to the ops worker without blocking the read loop. On a full
+// queue the outcome depends on the tier: an ephemeral Broadcast is droppable (design §9 — ephemerals
+// are dropped first under load), so a cursor flood is dropped, not fatal; a durable frame is not
+// droppable, so an over-producing client is disconnected (it resumes from lastSeq on reconnect)
+// rather than blocking the read loop and starving WS keepalive.
 func (c *conn) enqueue(m *aetherv1.ClientMessage) {
 	select {
 	case c.ops <- m:
+		return
 	default:
-		c.cancel()
 	}
+	if _, ok := m.GetBody().(*aetherv1.ClientMessage_Broadcast); ok {
+		return // drop the ephemeral broadcast
+	}
+	c.cancel()
 }
 
 // opsLoop serves room frames in arrival order, OFF the read loop, so a slow owner RPC (a Join
