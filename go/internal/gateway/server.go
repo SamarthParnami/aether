@@ -24,12 +24,13 @@ import (
 )
 
 const (
-	maxFrameBytes = 1 << 20 // per-frame read cap (1 MiB)
-	writeTimeout  = 10 * time.Second
-	outQueue      = 64 // buffered outbound frames per connection
-	opsQueue      = 64 // buffered inbound room frames awaiting the ops worker
-	pingInterval  = 30 * time.Second
-	pingTimeout   = 10 * time.Second
+	maxFrameBytes     = 1 << 20 // per-frame read cap (1 MiB)
+	writeTimeout      = 10 * time.Second
+	outQueue          = 64               // buffered outbound frames per connection
+	opsQueue          = 64               // buffered inbound room frames awaiting the ops worker
+	ephemeralOutLimit = outQueue * 3 / 4 // ephemerals may fill up to here; the top reserves room for events
+	pingInterval      = 30 * time.Second
+	pingTimeout       = 10 * time.Second
 )
 
 // defaultClientIDSecret is a DEV-ONLY HMAC key for client_id derivation, used only when no secret
@@ -203,7 +204,7 @@ func (c *conn) dispatch(ctx context.Context, m *aetherv1.ClientMessage) {
 	case *aetherv1.ClientMessage_Commit:
 		c.handleCommit(ctx, b.Commit)
 	case *aetherv1.ClientMessage_Broadcast:
-		c.send(errorFrame("UNIMPLEMENTED", "the ephemeral tier lands in a later gateway PR"))
+		c.handleBroadcast(ctx, b.Broadcast)
 	default:
 		c.send(errorFrame("INVALID", "empty or unknown frame"))
 	}
@@ -261,11 +262,13 @@ func (c *conn) handleJoin(ctx context.Context, join *aetherv1.Join) {
 	}
 	relayCtx, cancel := context.WithCancel(ctx)
 	c.rooms[join.GetRoomId()] = cancel
-	c.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
-		c.relay(relayCtx, join.GetRoomId(), owner, resp.Msg.GetRoomSeq())
-	}()
+	// Event + ephemeral relays are PAIRED under one ctx, started together at Join: a single
+	// Leave/re-Join/re-home cancels both as a unit. The ephemeral stream gives no independent
+	// re-home signal (it just goes silent), so only the event relay signals FROZEN; see
+	// roomruntime.TailEphemeral. Re-subscribing both on re-home lands with routing (G10).
+	c.wg.Add(2)
+	go func() { defer c.wg.Done(); c.relay(relayCtx, join.GetRoomId(), owner, resp.Msg.GetRoomSeq()) }()
+	go func() { defer c.wg.Done(); c.ephemeralRelay(relayCtx, join.GetRoomId(), owner) }()
 }
 
 // relay streams a room's events from its owner and forwards them to the client WS, until the relay
@@ -287,6 +290,25 @@ func (c *conn) relay(ctx context.Context, roomID string, owner aetherv1connect.R
 		c.send(&aetherv1.ServerMessage{Body: &aetherv1.ServerMessage_Event{Event: stream.Msg().GetEvent()}})
 	}
 	c.signalRoomFrozen(ctx, roomID)
+}
+
+// ephemeralRelay streams a room's live ephemerals from its owner to the client WS until the relay
+// ctx is cancelled or the stream ends. Paired with the event relay (started together at Join). It
+// does NOT signal FROZEN: the ephemeral tier gives no independent re-home signal (on re-home it just
+// goes silent), so the event relay is what detects a dropped feed and drives re-subscribing both
+// (G10). Frames go via sendEphemeral, which drops under outbound-queue pressure rather than
+// disconnecting — so a cursor flood can't starve committed events on the shared socket (design §9).
+func (c *conn) ephemeralRelay(ctx context.Context, roomID string, owner aetherv1connect.RoomServiceClient) {
+	stream, err := owner.SubscribeEphemeral(ctx, connect.NewRequest(&aetherv1.SubscribeEphemeralRequest{
+		RoomId: roomID,
+	}))
+	if err != nil {
+		return // best-effort; the paired event relay surfaces a dropped feed
+	}
+	defer func() { _ = stream.Close() }()
+	for stream.Receive() {
+		c.sendEphemeral(&aetherv1.ServerMessage{Body: &aetherv1.ServerMessage_Ephemeral{Ephemeral: stream.Msg().GetEphemeral()}})
+	}
 }
 
 // signalRoomFrozen tells the client a room's live feed dropped — but only when the relay died for
@@ -345,6 +367,31 @@ func (c *conn) handleCommit(ctx context.Context, commit *aetherv1.Commit) {
 	// committed / duplicate: the Event reaches the client via its relay; nothing to send here.
 }
 
+// handleBroadcast forwards an ephemeral broadcast to the room's owner. Best-effort: there is no ack
+// and no Nack tier, so a transient failure just drops the ephemeral (no disconnect over lossy data).
+// A broadcast to a room the client hasn't joined is a usage error and gets an Error frame. The
+// committed Event is fanned to subscribers by the owner; this connection sees it via its own
+// ephemeral relay (set up at Join), like any other subscriber.
+func (c *conn) handleBroadcast(ctx context.Context, b *aetherv1.Broadcast) {
+	room := b.GetRoomId()
+	if _, joined := c.rooms[room]; !joined {
+		c.send(errorFrame("INVALID", "broadcast to a room the client has not joined"))
+		return
+	}
+
+	owner, addr, err := c.srv.locator.Owner(room)
+	if err != nil {
+		return // no reachable owner — drop the ephemeral (best-effort)
+	}
+	if _, err := owner.Broadcast(ctx, connect.NewRequest(&aetherv1.BroadcastRequest{
+		RoomId:         room,
+		OriginClientId: c.clientID,
+		Body:           b.GetBody(),
+	})); err != nil {
+		c.srv.locator.Invalidate(addr) // stale owner — drop the ephemeral, re-resolve next time
+	}
+}
+
 // writeLoop is the sole writer: it drains the outbound queue to the socket.
 func (c *conn) writeLoop(ctx context.Context) {
 	for {
@@ -394,6 +441,19 @@ func (c *conn) send(m *aetherv1.ServerMessage) {
 	case c.out <- m:
 	default:
 		c.cancel()
+	}
+}
+
+// sendEphemeral enqueues an ephemeral frame but DROPS it under outbound-queue pressure instead of
+// disconnecting (unlike send). Per design §9 ephemerals are dropped first under load, so a cursor
+// flood can neither starve committed events on the shared queue nor trip the slow-client disconnect.
+func (c *conn) sendEphemeral(m *aetherv1.ServerMessage) {
+	if len(c.out) >= ephemeralOutLimit {
+		return // reserve the top of the queue for events; drop the ephemeral (lossy by design)
+	}
+	select {
+	case c.out <- m:
+	default: // racing fill — drop, never disconnect on an ephemeral
 	}
 }
 
