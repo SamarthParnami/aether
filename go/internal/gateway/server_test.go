@@ -88,24 +88,8 @@ func TestPingPong(t *testing.T) {
 	}
 }
 
-// The ephemeral tier (Broadcast) isn't wired yet: the gateway answers it with an UNIMPLEMENTED
-// error rather than dropping the connection. (Join/Leave/Commit are now handled.)
-func TestBroadcastUnimplemented(t *testing.T) {
-	srv := newTestServer()
-	defer srv.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	ws := dial(ctx, t, srv, "user-1")
-	defer func() { _ = ws.Close(websocket.StatusNormalClosure, "") }()
-
-	writeFrame(ctx, t, ws, &aetherv1.ClientMessage{
-		Body: &aetherv1.ClientMessage_Broadcast{Broadcast: &aetherv1.Broadcast{RoomId: "r"}},
-	})
-	if got := readFrame(ctx, t, ws).GetError().GetCode(); got != "UNIMPLEMENTED" {
-		t.Fatalf("error code = %q, want UNIMPLEMENTED", got)
-	}
-}
+// The ephemeral Broadcast tier is now wired (G8c) — see broadcast_test.go for the forward + relay
+// path and the not-joined error.
 
 // A handshake without a valid principal is rejected at the HTTP layer (no upgrade).
 func TestAuthRejected(t *testing.T) {
