@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"connectrpc.com/connect"
 
@@ -20,6 +21,12 @@ import (
 func kvBody(key, val string) *aetherv1.EventBody {
 	return &aetherv1.EventBody{
 		Kind: &aetherv1.EventBody_KvSet{KvSet: &aetherv1.KeyValueSet{Key: key, Value: []byte(val)}},
+	}
+}
+
+func ephBody(key, val string) *aetherv1.EphemeralBody {
+	return &aetherv1.EphemeralBody{
+		Kind: &aetherv1.EphemeralBody_KvSet{KvSet: &aetherv1.KeyValueSet{Key: key, Value: []byte(val)}},
 	}
 }
 
@@ -140,11 +147,75 @@ func TestSubscribeStreamsCatchUpThenLive(t *testing.T) {
 }
 
 // The ephemeral tier isn't wired yet: Broadcast is explicitly Unimplemented.
-func TestBroadcastUnimplemented(t *testing.T) {
-	client := newClient(t, roomruntime.New(logstore.NewMemory(), fanout.NewMemory()))
-	_, err := client.Broadcast(context.Background(),
-		connect.NewRequest(&aetherv1.BroadcastRequest{RoomId: "room"}))
-	if got := connect.CodeOf(err); got != connect.CodeUnimplemented {
-		t.Fatalf("broadcast code = %v (err=%v), want Unimplemented", got, err)
+// Broadcast publishes an ephemeral that a SubscribeEphemeral stream then receives — the ephemeral
+// tier end to end over RPC. It is live-only (no replay), so the test re-broadcasts until the
+// server-side subscription is in place and one delivery lands.
+func TestBroadcastDeliveredOverSubscribeEphemeral(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rt := roomruntime.New(logstore.NewMemory(), fanout.NewMemory())
+	client := newClient(t, rt)
+
+	// Ephemerals are live-only AND a Connect server-stream flushes its response headers only on the
+	// handler's first Send — which here happens only when a broadcast is delivered. So the
+	// broadcaster must run CONCURRENTLY with the subscribe (started first): it keeps broadcasting
+	// until one lands after the server-side subscription is in place, unblocking SubscribeEphemeral.
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		tick := time.NewTicker(15 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-tick.C:
+				_, _ = client.Broadcast(ctx, connect.NewRequest(&aetherv1.BroadcastRequest{
+					RoomId: "room", OriginClientId: "c1", Body: ephBody("cursor", "10,20"),
+				}))
+			}
+		}
+	}()
+
+	stream, err := client.SubscribeEphemeral(ctx,
+		connect.NewRequest(&aetherv1.SubscribeEphemeralRequest{RoomId: "room"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stream.Close() }()
+
+	if !stream.Receive() {
+		t.Fatalf("receive ephemeral: %v", stream.Err())
+	}
+	eph := stream.Msg().GetEphemeral()
+	if eph.GetRoomId() != "room" || eph.GetOriginClientId() != "c1" {
+		t.Fatalf("ephemeral = %v, want room/c1", eph)
+	}
+	if v := string(eph.GetBody().GetKvSet().GetValue()); v != "10,20" {
+		t.Fatalf("body value = %q, want 10,20", v)
+	}
+}
+
+// A node that doesn't own the room answers Broadcast with FAILED_PRECONDITION so the gateway
+// re-resolves to the real owner (on whose ephemeral bus the subscribers are).
+func TestBroadcastNotOwnerIsFailedPrecondition(t *testing.T) {
+	ctx := context.Background()
+	log := logstore.NewMemory()
+	co := coord.NewMemory()
+	a := roomruntime.New(log, fanout.NewMemory(),
+		roomruntime.WithNodeID("A"), roomruntime.WithCoordinator(co))
+	b := roomruntime.New(log, fanout.NewMemory(),
+		roomruntime.WithNodeID("B"), roomruntime.WithCoordinator(co))
+
+	if _, applied, err := a.Commit(ctx, "room", "A", 1, kvBody("k", "v")); err != nil || !applied {
+		t.Fatalf("A commit: applied=%v err=%v", applied, err)
+	}
+
+	client := newClient(t, b) // B does not own the room A holds
+	_, err := client.Broadcast(ctx, connect.NewRequest(&aetherv1.BroadcastRequest{
+		RoomId: "room", OriginClientId: "x", Body: ephBody("k", "v"),
+	}))
+	if got := connect.CodeOf(err); got != connect.CodeFailedPrecondition {
+		t.Fatalf("broadcast code = %v (err=%v), want FailedPrecondition", got, err)
 	}
 }

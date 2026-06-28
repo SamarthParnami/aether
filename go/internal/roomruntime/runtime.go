@@ -59,6 +59,7 @@ type Runtime struct {
 	addr     string // this node's dialable RPC address, published with each lease claim
 	log      logstore.LogStore
 	fanout   fanout.Fanout
+	efanout  fanout.EphemeralFanout // best-effort ephemeral tier (cursors/presence/…), separate bus
 	coord    coord.Coordinator
 	now      func() time.Time
 	ttl      time.Duration
@@ -90,6 +91,14 @@ func WithAddr(addr string) Option { return func(r *Runtime) { r.addr = addr } }
 // same room must share one coordinator (in prod, the DynamoDB-backed impl).
 func WithCoordinator(co coord.Coordinator) Option { return func(r *Runtime) { r.coord = co } }
 
+// WithEphemeralFanout injects the bus for the best-effort ephemeral tier (Broadcast /
+// TailEphemeral). Defaults to a private in-memory bus. In a cluster every node serving a given
+// room must reach the same ephemeral bus (the shared Redis pub/sub impl) for cross-node delivery,
+// exactly as the durable fan-out does.
+func WithEphemeralFanout(ef fanout.EphemeralFanout) Option {
+	return func(r *Runtime) { r.efanout = ef }
+}
+
 // WithClock injects the clock used to drive lease expiry. Defaults to time.Now; tests pass a
 // virtual clock so failover timing is deterministic.
 func WithClock(now func() time.Time) Option { return func(r *Runtime) { r.now = now } }
@@ -116,6 +125,7 @@ func New(log logstore.LogStore, fo fanout.Fanout, opts ...Option) *Runtime {
 		nodeID:   "local",
 		log:      log,
 		fanout:   fo,
+		efanout:  fanout.NewMemoryEphemeral(),
 		coord:    coord.NewMemory(),
 		now:      time.Now,
 		ttl:      defaultLeaseTTL,
