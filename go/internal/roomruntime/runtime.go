@@ -38,6 +38,15 @@ import (
 // comfortably larger than the (later) renewal interval and the max inter-node clock skew.
 const defaultLeaseTTL = 10 * time.Second
 
+// defaultTailPollInterval is the coarse backstop at which Tail re-reads the durable log even with
+// no fan-out wake. It is the correctness FLOOR beneath the wake buses (the local in-memory bus now;
+// a shared Redis fan-out later): re-reading the log — which is independent of any bus — keeps a
+// reader correct, with bounded staleness, whenever wakes don't arrive: a re-home (the new owner's
+// commits fire ITS bus), a cross-node subscriber, a dropped pub/sub message, or a full Redis
+// outage. The wake is the fast path; the poll only governs the degraded case, so it is deliberately
+// coarse — cheap per stream at watcher scale.
+const defaultTailPollInterval = 3 * time.Second
+
 // ErrNotOwner is returned by Commit/Join when this node does not hold the room's ownership
 // lease — another node is the live owner. The caller (gateway) should route to the real owner
 // or retry after the lease lapses; it must not treat the operation as applied.
@@ -46,13 +55,14 @@ var ErrNotOwner = errors.New("roomruntime: not the room owner")
 // Runtime owns a set of rooms on this node. Ownership is enforced per room via the coord
 // lease; a Runtime serves only rooms whose lease it currently holds.
 type Runtime struct {
-	nodeID string
-	addr   string // this node's dialable RPC address, published with each lease claim
-	log    logstore.LogStore
-	fanout fanout.Fanout
-	coord  coord.Coordinator
-	now    func() time.Time
-	ttl    time.Duration
+	nodeID   string
+	addr     string // this node's dialable RPC address, published with each lease claim
+	log      logstore.LogStore
+	fanout   fanout.Fanout
+	coord    coord.Coordinator
+	now      func() time.Time
+	ttl      time.Duration
+	tailPoll time.Duration // Tail log re-read interval (bounded staleness when wakeups are missing)
 
 	// A single Runtime-wide mutex serializes all rooms, and is held across the durable append
 	// — a deliberate single-node Phase-1 simplification. Per-room serialization (a per-room
@@ -87,17 +97,23 @@ func WithClock(now func() time.Time) Option { return func(r *Runtime) { r.now = 
 // WithLeaseTTL sets the lease lifetime acquired on each claim/renew.
 func WithLeaseTTL(ttl time.Duration) Option { return func(r *Runtime) { r.ttl = ttl } }
 
+// WithTailPollInterval sets how often Tail re-reads the log absent a fan-out wakeup — the bound on
+// read staleness when the room is served by a node that isn't being woken (e.g. after a re-home).
+// Defaults to defaultTailPollInterval.
+func WithTailPollInterval(d time.Duration) Option { return func(r *Runtime) { r.tailPoll = d } }
+
 // New returns a Runtime backed by the given log and fan-out bus. Without options it is a
 // self-contained single-node owner (private coordinator) — every room it touches is its own.
 func New(log logstore.LogStore, fo fanout.Fanout, opts ...Option) *Runtime {
 	r := &Runtime{
-		nodeID: "local",
-		log:    log,
-		fanout: fo,
-		coord:  coord.NewMemory(),
-		now:    time.Now,
-		ttl:    defaultLeaseTTL,
-		rooms:  map[string]*roomcore.Room{},
+		nodeID:   "local",
+		log:      log,
+		fanout:   fo,
+		coord:    coord.NewMemory(),
+		now:      time.Now,
+		ttl:      defaultLeaseTTL,
+		tailPoll: defaultTailPollInterval,
+		rooms:    map[string]*roomcore.Room{},
 	}
 	for _, opt := range opts {
 		opt(r)

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	aetherv1 "github.com/SamarthParnami/aether/go/gen/aether/v1"
+	"github.com/SamarthParnami/aether/go/internal/coord"
 	"github.com/SamarthParnami/aether/go/internal/fanout"
 	"github.com/SamarthParnami/aether/go/internal/logstore"
 	"github.com/SamarthParnami/aether/go/internal/roomruntime"
@@ -123,6 +124,54 @@ func TestTailStopsOnContextCancel(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Tail did not return after ctx cancel")
+	}
+}
+
+// A reader doesn't freeze when the room re-homes: even though the new owner's commits fire ITS
+// fan-out (never this node's), the poll re-reads the shared log and delivers them within an
+// interval — the correctness floor beneath the wake buses. (Short poll interval keeps the test fast.)
+func TestTailPollSurvivesReHome(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	log := logstore.NewMemory()
+	co := coord.NewMemory()
+	clk := &fakeClock{t: time.Unix(1000, 0)}
+	mk := func(id string) *roomruntime.Runtime {
+		return roomruntime.New(log, fanout.NewMemory(),
+			roomruntime.WithNodeID(id),
+			roomruntime.WithCoordinator(co),
+			roomruntime.WithClock(clk.now),
+			roomruntime.WithLeaseTTL(testTTL),
+			roomruntime.WithTailPollInterval(20*time.Millisecond),
+		)
+	}
+	a, b := mk("A"), mk("B")
+
+	if _, applied, err := a.Commit(ctx, "room", "A", 1, kvBody("k", "1")); err != nil || !applied {
+		t.Fatalf("A commit: applied=%v err=%v", applied, err)
+	}
+
+	got := make(chan uint64, 16)
+	go func() {
+		_ = a.Tail(ctx, "room", 0, func(ev *aetherv1.Event) error {
+			got <- ev.GetRoomSeq()
+			return nil
+		})
+	}()
+	if s := recvSeq(t, got); s != 1 {
+		t.Fatalf("catch-up = %d, want 1", s)
+	}
+
+	// A's lease lapses; B takes over and commits — firing B's fan-out, which A's Tail never sees.
+	clk.advance(testTTL + time.Second)
+	if _, applied, err := b.Commit(ctx, "room", "B", 1, kvBody("k", "2")); err != nil || !applied {
+		t.Fatalf("B takeover commit: applied=%v err=%v", applied, err)
+	}
+
+	// The poll re-reads the shared log and delivers B's write — the reader does not freeze.
+	if s := recvSeq(t, got); s != 2 {
+		t.Fatalf("after re-home the poll delivered %d, want 2 (the new owner's write)", s)
 	}
 }
 
