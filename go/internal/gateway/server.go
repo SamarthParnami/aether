@@ -216,9 +216,16 @@ func (c *conn) dispatch(ctx context.Context, m *aetherv1.ClientMessage) {
 	}
 }
 
-// handleJoin serves a fresh Join: derive the client's stable id, resolve the room's owner, fetch
-// the current snapshot, and reply Joined. (Live event relay and resume catch-up land next, in
-// G6b/G9; FROZEN/retry on no-owner lands with routing, G10.)
+// handleJoin serves a Join: derive the client's stable id, resolve the room's owner, and start the
+// paired event + ephemeral relays. from_seq selects the catch-up strategy:
+//   - from_seq == 0 (fresh): fetch the snapshot and reply Joined carrying it; relay events after it.
+//   - from_seq  > 0 (resume): the client already holds state up to its cursor, so SKIP the snapshot
+//     and relay only the gap (events > from_seq) then live — the cheap reconnect path. The owner's
+//     Subscribe replays the gap from the log, so it's correct even across a gateway change or
+//     re-home. (A from_seq below the log floor will deep-resume via snapshot once compaction exists;
+//     no floor today, so every cursor is replayable — see ownerrpc Subscribe's OUT_OF_RANGE TODO.)
+//
+// FROZEN/retry on no-owner lands with routing (G10).
 func (c *conn) handleJoin(ctx context.Context, join *aetherv1.Join) {
 	if join.GetSessionNonce() == "" {
 		// Without a nonce, all of a principal's sessions collapse onto one client_id and their
@@ -239,42 +246,53 @@ func (c *conn) handleJoin(ctx context.Context, join *aetherv1.Join) {
 		return
 	}
 
-	owner, _, err := c.srv.locator.Owner(join.GetRoomId())
+	room := join.GetRoomId()
+	owner, _, err := c.srv.locator.Owner(room)
 	if err != nil {
 		c.send(errorFrame("UNAVAILABLE", "room has no reachable owner"))
 		return
 	}
 
-	resp, err := owner.GetSnapshot(ctx, connect.NewRequest(&aetherv1.GetSnapshotRequest{
-		RoomId: join.GetRoomId(),
-	}))
-	if err != nil {
-		c.send(errorFrame("UNAVAILABLE", "could not fetch room snapshot"))
-		return
+	// fromSeq is the cursor the relay streams events after. Fresh join sets it from the snapshot;
+	// resume takes the client's supplied cursor and skips the snapshot entirely.
+	fromSeq := join.GetFromSeq()
+	if fromSeq == 0 {
+		resp, err := owner.GetSnapshot(ctx, connect.NewRequest(&aetherv1.GetSnapshotRequest{RoomId: room}))
+		if err != nil {
+			c.send(errorFrame("UNAVAILABLE", "could not fetch room snapshot"))
+			return
+		}
+		fromSeq = resp.Msg.GetRoomSeq()
+		c.send(&aetherv1.ServerMessage{Body: &aetherv1.ServerMessage_Joined{Joined: &aetherv1.Joined{
+			RoomId:     room,
+			ClientId:   clientID,
+			CurrentSeq: fromSeq,
+			Snapshot:   &aetherv1.Snapshot{RoomSeq: fromSeq, State: resp.Msg.GetState()},
+		}}})
+	} else {
+		// Resume: no snapshot — the client keeps its state and the relay fills the gap from its cursor.
+		c.send(&aetherv1.ServerMessage{Body: &aetherv1.ServerMessage_Joined{Joined: &aetherv1.Joined{
+			RoomId:     room,
+			ClientId:   clientID,
+			CurrentSeq: fromSeq,
+		}}})
 	}
 
-	c.send(&aetherv1.ServerMessage{Body: &aetherv1.ServerMessage_Joined{Joined: &aetherv1.Joined{
-		RoomId:     join.GetRoomId(),
-		ClientId:   clientID,
-		CurrentSeq: resp.Msg.GetRoomSeq(),
-		Snapshot:   &aetherv1.Snapshot{RoomSeq: resp.Msg.GetRoomSeq(), State: resp.Msg.GetState()},
-	}}})
-
-	// Relay live events from just after the snapshot — no gap (Subscribe replays from from_seq),
-	// no dup (snapshot is state ≤ room_seq, the stream is events > room_seq). A re-Join replaces
-	// the prior relay.
-	if cancel, ok := c.rooms[join.GetRoomId()]; ok {
+	// Relay events strictly after fromSeq — no gap (Subscribe replays from the cursor), no dup
+	// (fresh: snapshot is state ≤ fromSeq; resume: client already holds ≤ fromSeq). A re-Join
+	// replaces the prior relay.
+	if cancel, ok := c.rooms[room]; ok {
 		cancel()
 	}
 	relayCtx, cancel := context.WithCancel(ctx)
-	c.rooms[join.GetRoomId()] = cancel
+	c.rooms[room] = cancel
 	// Event + ephemeral relays are PAIRED under one ctx, started together at Join: a single
 	// Leave/re-Join/re-home cancels both as a unit. The ephemeral stream gives no independent
 	// re-home signal (it just goes silent), so only the event relay signals FROZEN; see
 	// roomruntime.TailEphemeral. Re-subscribing both on re-home lands with routing (G10).
 	c.wg.Add(2)
-	go func() { defer c.wg.Done(); c.relay(relayCtx, join.GetRoomId(), owner, resp.Msg.GetRoomSeq()) }()
-	go func() { defer c.wg.Done(); c.ephemeralRelay(relayCtx, join.GetRoomId(), owner) }()
+	go func() { defer c.wg.Done(); c.relay(relayCtx, room, owner, fromSeq) }()
+	go func() { defer c.wg.Done(); c.ephemeralRelay(relayCtx, room, owner) }()
 }
 
 // relay streams a room's events from its owner and forwards them to the client WS, until the relay
