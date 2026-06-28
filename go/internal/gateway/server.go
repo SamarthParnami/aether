@@ -102,6 +102,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 type conn struct {
 	srv       *Server
 	principal Principal
+	clientID  string // derived at Join (HMAC of principal+nonce); the dedup identity for commits
 	ws        *websocket.Conn
 	out       chan *aetherv1.ServerMessage
 	cancel    context.CancelFunc
@@ -161,8 +162,10 @@ func (c *conn) dispatch(ctx context.Context, m *aetherv1.ClientMessage) {
 		c.handleJoin(ctx, b.Join)
 	case *aetherv1.ClientMessage_Leave:
 		c.handleLeave(b.Leave)
-	case *aetherv1.ClientMessage_Commit, *aetherv1.ClientMessage_Broadcast:
-		c.send(errorFrame("UNIMPLEMENTED", "room handling lands in a later gateway PR"))
+	case *aetherv1.ClientMessage_Commit:
+		c.handleCommit(ctx, b.Commit)
+	case *aetherv1.ClientMessage_Broadcast:
+		c.send(errorFrame("UNIMPLEMENTED", "the ephemeral tier lands in a later gateway PR"))
 	default:
 		c.send(errorFrame("INVALID", "empty or unknown frame"))
 	}
@@ -180,6 +183,16 @@ func (c *conn) handleJoin(ctx context.Context, join *aetherv1.Join) {
 		return
 	}
 	clientID := deriveClientID(c.srv.secret, c.principal.ID, join.GetSessionNonce())
+	// Pin the dedup identity on the FIRST Join. A later Join with a different nonce would shift
+	// c.clientID mid-session, so a subsequent commit (even to an earlier room) would go out under a
+	// different identity and a replay wouldn't dedup — breaking exactly-once. Reject the mismatch
+	// rather than letting last-Join-win.
+	if c.clientID == "" {
+		c.clientID = clientID
+	} else if clientID != c.clientID {
+		c.send(errorFrame("INVALID", "session_nonce must match the connection's first Join"))
+		return
+	}
 
 	owner, _, err := c.srv.locator.Owner(join.GetRoomId())
 	if err != nil {
@@ -259,6 +272,41 @@ func (c *conn) handleLeave(leave *aetherv1.Leave) {
 	}
 }
 
+// handleCommit forwards a durable commit to the room's owner. The committed Event returns to the
+// client via its relay (fan-out is the ack), so success is silent here — only a rejection or a
+// failure produces a frame. A commit to a room the client hasn't joined is refused NOT_JOINED.
+func (c *conn) handleCommit(ctx context.Context, commit *aetherv1.Commit) {
+	room := commit.GetRoomId()
+	if _, joined := c.rooms[room]; !joined {
+		c.send(nackFrame(room, commit.GetClientSeq(), aetherv1.NackReason_NACK_REASON_NOT_JOINED))
+		return
+	}
+
+	owner, addr, err := c.srv.locator.Owner(room)
+	if err != nil {
+		c.send(errorFrame("UNAVAILABLE", "room has no reachable owner"))
+		return
+	}
+
+	resp, err := owner.Commit(ctx, connect.NewRequest(&aetherv1.CommitRequest{
+		RoomId:    room,
+		ClientId:  c.clientID,
+		ClientSeq: commit.GetClientSeq(),
+		Body:      commit.GetBody(),
+	}))
+	if err != nil {
+		// Not (or no longer) the owner, or a transport failure: drop the dead client and signal
+		// unavailable. Re-resolve + retry (and FROZEN) land with routing (G10).
+		c.srv.locator.Invalidate(addr)
+		c.send(errorFrame("UNAVAILABLE", "commit could not be routed to the owner"))
+		return
+	}
+	if nack := resp.Msg.GetNack(); nack != nil {
+		c.send(&aetherv1.ServerMessage{Body: &aetherv1.ServerMessage_Nack{Nack: nack}})
+	}
+	// committed / duplicate: the Event reaches the client via its relay; nothing to send here.
+}
+
 // writeLoop is the sole writer: it drains the outbound queue to the socket.
 func (c *conn) writeLoop(ctx context.Context) {
 	for {
@@ -315,4 +363,10 @@ func errorFrame(code, msg string) *aetherv1.ServerMessage {
 	return &aetherv1.ServerMessage{
 		Body: &aetherv1.ServerMessage_Error{Error: &aetherv1.Error{Code: code, Message: msg}},
 	}
+}
+
+func nackFrame(roomID string, clientSeq uint64, reason aetherv1.NackReason) *aetherv1.ServerMessage {
+	return &aetherv1.ServerMessage{Body: &aetherv1.ServerMessage_Nack{Nack: &aetherv1.Nack{
+		RoomId: roomID, ClientSeq: clientSeq, Reason: reason,
+	}}}
 }

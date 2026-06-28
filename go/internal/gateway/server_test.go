@@ -88,9 +88,9 @@ func TestPingPong(t *testing.T) {
 	}
 }
 
-// Room frames aren't wired yet: the skeleton answers them with an UNIMPLEMENTED error rather
-// than dropping the connection.
-func TestRoomFrameUnimplemented(t *testing.T) {
+// The ephemeral tier (Broadcast) isn't wired yet: the gateway answers it with an UNIMPLEMENTED
+// error rather than dropping the connection. (Join/Leave/Commit are now handled.)
+func TestBroadcastUnimplemented(t *testing.T) {
 	srv := newTestServer()
 	defer srv.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -100,7 +100,7 @@ func TestRoomFrameUnimplemented(t *testing.T) {
 	defer func() { _ = ws.Close(websocket.StatusNormalClosure, "") }()
 
 	writeFrame(ctx, t, ws, &aetherv1.ClientMessage{
-		Body: &aetherv1.ClientMessage_Commit{Commit: &aetherv1.Commit{RoomId: "r", ClientSeq: 1}},
+		Body: &aetherv1.ClientMessage_Broadcast{Broadcast: &aetherv1.Broadcast{RoomId: "r"}},
 	})
 	if got := readFrame(ctx, t, ws).GetError().GetCode(); got != "UNIMPLEMENTED" {
 		t.Fatalf("error code = %q, want UNIMPLEMENTED", got)

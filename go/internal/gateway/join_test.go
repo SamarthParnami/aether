@@ -181,6 +181,39 @@ func TestJoinEmptyNonceRejected(t *testing.T) {
 	}
 }
 
+// The dedup identity is pinned on the first Join: a later Join with a different session_nonce is
+// rejected, so client_id can't shift mid-session and break exactly-once.
+func TestJoinNonceMismatchRejected(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	co := coord.NewMemory()
+	owner, _ := startOwner(t, co, "owner")
+	owner.Commit(context.Background(), "room", "A", 1, kvBody("k", "1"))
+
+	gw := httptest.NewServer(gateway.NewServer(
+		gateway.DevAuthenticator{Header: authHeader},
+		gateway.NewOwnerLocator(co),
+	))
+	defer gw.Close()
+
+	ws := dial(ctx, t, gw, "user-1")
+	defer func() { _ = ws.Close(websocket.StatusNormalClosure, "") }()
+
+	writeFrame(ctx, t, ws, &aetherv1.ClientMessage{Body: &aetherv1.ClientMessage_Join{Join: &aetherv1.Join{
+		RoomId: "room", SessionNonce: "nonce-A",
+	}}})
+	readFrame(ctx, t, ws) // Joined under nonce-A
+
+	// A second Join with a different nonce must be refused (would shift the dedup identity).
+	writeFrame(ctx, t, ws, &aetherv1.ClientMessage{Body: &aetherv1.ClientMessage_Join{Join: &aetherv1.Join{
+		RoomId: "room", SessionNonce: "nonce-B",
+	}}})
+	if code := readFrame(ctx, t, ws).GetError().GetCode(); code != "INVALID" {
+		t.Fatalf("nonce-mismatch Join error code = %q, want INVALID", code)
+	}
+}
+
 // A Join to a room with no reachable owner yields an error frame (FROZEN/retry lands with routing).
 func TestJoinNoOwnerErrors(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
