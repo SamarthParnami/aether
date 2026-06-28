@@ -12,13 +12,17 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	aetherv1 "github.com/SamarthParnami/aether/go/gen/aether/v1"
+	"github.com/SamarthParnami/aether/go/internal/coord"
 	"github.com/SamarthParnami/aether/go/internal/gateway"
 )
 
 const authHeader = "X-Aether-Principal"
 
 func newTestServer() *httptest.Server {
-	return httptest.NewServer(gateway.NewServer(gateway.DevAuthenticator{Header: authHeader}))
+	return httptest.NewServer(gateway.NewServer(
+		gateway.DevAuthenticator{Header: authHeader},
+		gateway.NewOwnerLocator(coord.NewMemory()),
+	))
 }
 
 func wsURL(srv *httptest.Server) string { return "ws" + strings.TrimPrefix(srv.URL, "http") }
