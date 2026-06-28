@@ -50,10 +50,14 @@ func (r *Runtime) Broadcast(
 // and gets no catch-up. Two consequences follow from that:
 //   - The fan-out handler must never block the broadcaster (the bus delivers synchronously), so it
 //     hands off through a bounded channel and DROPS on overflow rather than applying backpressure.
-//   - There is no shared store to self-heal a mid-stream re-home (the durable Tail re-reads the
-//     shared log; here there is none). So if the room moves to another node this stream silently
-//     goes quiet; recovering it is the gateway's job — re-resolve the owner and re-subscribe — the
-//     same re-home recovery G10 handles for the event relay.
+//   - There is no shared store to self-heal a mid-stream re-home, and — unlike the event relay —
+//     no INDEPENDENT re-home signal either: on re-home the old owner is usually still alive, so
+//     this stream stays open and SILENT (no error, no event, and no log to re-read). So nothing on
+//     the ephemeral path itself can trigger recovery. It works only because a client's ephemeral
+//     subscription is always PAIRED with an event subscription (Join sets up both): the event
+//     path's re-home detection (G10) is what must re-subscribe BOTH streams together, as a unit. So
+//     an ephemeral stream must never be opened without a paired event stream, or a re-home would
+//     silently strand it.
 //
 // Ownership is confirmed once at the start so the subscription lands on the node that actually
 // receives this room's broadcasts; a non-owner returns ErrNotOwner for the gateway to re-resolve.
