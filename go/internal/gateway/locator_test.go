@@ -63,7 +63,7 @@ func TestLocatorResolvesAndDialsOwner(t *testing.T) {
 	}
 
 	loc := gateway.NewOwnerLocator(co)
-	client, err := loc.Owner("room")
+	client, _, err := loc.Owner("room")
 	if err != nil {
 		t.Fatalf("Owner(room): %v", err)
 	}
@@ -83,7 +83,7 @@ func TestLocatorResolvesAndDialsOwner(t *testing.T) {
 // A room with no live lease has no owner to dial.
 func TestLocatorNoOwner(t *testing.T) {
 	loc := gateway.NewOwnerLocator(coord.NewMemory())
-	if _, err := loc.Owner("nope"); !errors.Is(err, gateway.ErrNoOwner) {
+	if _, _, err := loc.Owner("nope"); !errors.Is(err, gateway.ErrNoOwner) {
 		t.Fatalf("Owner of an unowned room = %v, want ErrNoOwner", err)
 	}
 }
@@ -95,7 +95,7 @@ func TestLocatorEmptyAddrIsNoOwner(t *testing.T) {
 	co.Claim("room", "owner-without-addr", "", time.Now(), 10*time.Second) // empty addr
 
 	loc := gateway.NewOwnerLocator(co)
-	if _, err := loc.Owner("room"); !errors.Is(err, gateway.ErrNoOwner) {
+	if _, _, err := loc.Owner("room"); !errors.Is(err, gateway.ErrNoOwner) {
 		t.Fatalf("Owner with empty addr = %v, want ErrNoOwner", err)
 	}
 }
@@ -109,7 +109,7 @@ func TestLocatorExpiredLeaseIsNoOwner(t *testing.T) {
 	loc := gateway.NewOwnerLocator(co, gateway.WithLocatorClock(func() time.Time {
 		return t0.Add(11 * time.Second) // past expiry
 	}))
-	if _, err := loc.Owner("room"); !errors.Is(err, gateway.ErrNoOwner) {
+	if _, _, err := loc.Owner("room"); !errors.Is(err, gateway.ErrNoOwner) {
 		t.Fatalf("Owner of a lapsed lease = %v, want ErrNoOwner", err)
 	}
 }
@@ -120,15 +120,36 @@ func TestLocatorPoolsClientPerOwner(t *testing.T) {
 	co.Claim("room", "owner", "127.0.0.1:9999", time.Now(), 10*time.Second)
 
 	loc := gateway.NewOwnerLocator(co)
-	a, err := loc.Owner("room")
+	a, _, err := loc.Owner("room")
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := loc.Owner("room")
+	b, _, err := loc.Owner("room")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if a != b {
 		t.Fatal("locator dialed a fresh client instead of pooling the owner's")
+	}
+}
+
+// Invalidate drops a pooled client so the next Owner re-dials — the failover/dial-error half of
+// pooling, so dead clients don't linger as owner addresses churn across deploys.
+func TestLocatorInvalidateEvictsClient(t *testing.T) {
+	co := coord.NewMemory()
+	co.Claim("room", "owner", "127.0.0.1:9999", time.Now(), 10*time.Second)
+
+	loc := gateway.NewOwnerLocator(co)
+	a, addr, err := loc.Owner("room")
+	if err != nil {
+		t.Fatal(err)
+	}
+	loc.Invalidate(addr)
+	b, _, err := loc.Owner("room")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a == b {
+		t.Fatal("Invalidate did not evict the pooled client")
 	}
 }

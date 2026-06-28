@@ -36,6 +36,14 @@ type LocatorOption func(*OwnerLocator)
 // WithLocatorHTTPClient injects the HTTP client used to dial owners (shared transport for pooling).
 // Defaults to a zero-timeout *http.Client — a per-request timeout would kill long-lived Subscribe
 // streams; unary calls bound themselves with the request context instead.
+//
+// The default transport speaks HTTP/1.1, so each concurrent Subscribe stream holds its own TCP
+// connection gateway→owner, and http.DefaultTransport's MaxIdleConnsPerHost=2 then starves unary
+// Commit/GetSnapshot reuse to the same owner. That does NOT scale to the watcher counts this design
+// targets — h2c multiplexing (thousands of streams over a handful of connections) is load-bearing
+// for the streaming tier, not cosmetic. G6/G11 inject an h2c client through this seam once real
+// stream load lands: a golang.org/x/net/http2.Transport{AllowHTTP: true, DialTLSContext: <plaintext
+// dial>}.
 func WithLocatorHTTPClient(h connect.HTTPClient) LocatorOption {
 	return func(l *OwnerLocator) { l.httpClient = h }
 }
@@ -59,14 +67,27 @@ func NewOwnerLocator(co coord.Coordinator, opts ...LocatorOption) *OwnerLocator 
 	return l
 }
 
-// Owner returns the RoomService client for roomID's current owner, or ErrNoOwner when there is no
-// reachable owner — no live lease, or a non-routable (empty Addr) one.
-func (l *OwnerLocator) Owner(roomID string) (aetherv1connect.RoomServiceClient, error) {
+// Owner returns the RoomService client for roomID's current owner and the owner's address, or
+// ErrNoOwner when there is no reachable owner — no live lease, or a non-routable (empty Addr) one.
+// The caller passes the returned address back to Invalidate after a dial/transport failure so the
+// dead client is dropped and the next Owner re-creates against the live (possibly re-homed) owner.
+func (l *OwnerLocator) Owner(roomID string) (aetherv1connect.RoomServiceClient, string, error) {
 	lease, ok := l.coord.Current(roomID, l.now())
 	if !ok || lease.Addr == "" {
-		return nil, ErrNoOwner
+		return nil, "", ErrNoOwner
 	}
-	return l.clientFor(lease.Addr), nil
+	return l.clientFor(lease.Addr), lease.Addr, nil
+}
+
+// Invalidate drops the pooled client for an owner address — the invalidation half of the pool the
+// design specifies (§2: "invalidated on failover / dial errors"). The gateway calls it after a
+// dial/RPC transport failure to that owner (the pod is gone, or the room re-homed), so the next
+// Owner re-creates against the live address rather than reusing a dead client and leaking its idle
+// connections. A no-op if the address isn't pooled.
+func (l *OwnerLocator) Invalidate(addr string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.clients, addr)
 }
 
 // clientFor returns a pooled RoomService client for an owner address, creating one on first use.
