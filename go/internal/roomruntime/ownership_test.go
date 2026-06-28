@@ -136,3 +136,27 @@ func TestSingleOwnerRenewsAcrossCommits(t *testing.T) {
 		t.Fatalf("join: seq=%d err=%v, want 3", joined.GetCurrentSeq(), err)
 	}
 }
+
+// A Runtime publishes its dialable address into the lease, so the directory (coord.Current) can
+// route a gateway to the owner — the routing substrate the gateway is built on.
+func TestRuntimePublishesAddrIntoLease(t *testing.T) {
+	ctx := context.Background()
+	co := coord.NewMemory()
+	clk := &fakeClock{t: time.Unix(1000, 0)}
+	rt := roomruntime.New(logstore.NewMemory(), fanout.NewMemory(),
+		roomruntime.WithNodeID("A"),
+		roomruntime.WithAddr("a.example:7001"),
+		roomruntime.WithCoordinator(co),
+		roomruntime.WithClock(clk.now),
+		roomruntime.WithLeaseTTL(testTTL),
+	)
+
+	if _, applied, err := rt.Commit(ctx, "room", "x", 1, kvBody("k", "v")); err != nil || !applied {
+		t.Fatalf("commit: applied=%v err=%v", applied, err)
+	}
+
+	lease, ok := co.Current("room", clk.now())
+	if !ok || lease.Owner != "A" || lease.Addr != "a.example:7001" {
+		t.Fatalf("directory lease = %+v, %v; want owner A @ a.example:7001", lease, ok)
+	}
+}
