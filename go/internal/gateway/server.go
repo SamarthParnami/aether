@@ -11,6 +11,7 @@ package gateway
 import (
 	"context"
 	"log"
+	"math/rand/v2"
 	"net/http"
 	"sync"
 	"time"
@@ -24,14 +25,15 @@ import (
 )
 
 const (
-	maxFrameBytes      = 1 << 20 // per-frame read cap (1 MiB)
-	writeTimeout       = 10 * time.Second
-	outQueue           = 64                     // buffered outbound frames per connection
-	opsQueue           = 64                     // buffered inbound room frames awaiting the ops worker
-	ephemeralOutLimit  = outQueue * 3 / 4       // ephemerals may fill up to here; the top reserves room for events
-	relayRetryInterval = 200 * time.Millisecond // backoff between owner re-resolve attempts during failover
-	pingInterval       = 30 * time.Second
-	pingTimeout        = 10 * time.Second
+	maxFrameBytes     = 1 << 20 // per-frame read cap (1 MiB)
+	writeTimeout      = 10 * time.Second
+	outQueue          = 64                     // buffered outbound frames per connection
+	opsQueue          = 64                     // buffered inbound room frames awaiting the ops worker
+	ephemeralOutLimit = outQueue * 3 / 4       // ephemerals may fill up to here; the top reserves room for events
+	relayRetryBase    = 200 * time.Millisecond // first owner re-resolve delay during failover (re-homes are usually quick)
+	relayRetryCap     = 5 * time.Second        // backoff ceiling — bounds the sustained re-resolve rate per watcher
+	pingInterval      = 30 * time.Second
+	pingTimeout       = 10 * time.Second
 )
 
 // defaultClientIDSecret is a DEV-ONLY HMAC key for client_id derivation, used only when no secret
@@ -309,6 +311,11 @@ func (c *conn) handleJoin(ctx context.Context, join *aetherv1.Join) {
 func (c *conn) relay(ctx context.Context, roomID string, fromSeq uint64) {
 	cursor := fromSeq
 	frozen := false
+	// Exponential backoff with jitter on the re-resolve loop. A presenter re-home freezes ALL their
+	// watchers at once; a fixed interval would make them hammer coord in lockstep (a DynamoDB read
+	// each, later) at the worst moment. Backoff + jitter spreads the herd. A successful subscribe
+	// resets it, so a quick owner-death→recovery still retries fast — only a SUSTAINED no-owner backs off.
+	backoff := relayRetryBase
 	for {
 		if ctx.Err() != nil {
 			return
@@ -317,22 +324,28 @@ func (c *conn) relay(ctx context.Context, roomID string, fromSeq uint64) {
 		if err != nil {
 			// No reachable owner right now (lease lapsed / mid re-home) — freeze and retry.
 			c.freeze(ctx, roomID, &frozen)
-			if !waitRetry(ctx) {
+			if !waitRetry(ctx, backoff) {
 				return
 			}
+			backoff = nextBackoff(backoff)
 			continue
 		}
 
-		cursor = c.streamRoom(ctx, roomID, owner, cursor, &frozen)
+		var subscribed bool
+		cursor, subscribed = c.streamRoom(ctx, roomID, owner, cursor, &frozen)
 		if ctx.Err() != nil {
 			return // clean shutdown — client left
 		}
 		// The stream ended for an owner-side reason: drop the stale owner so the next resolve re-dials.
 		c.srv.locator.Invalidate(addr)
 		c.freeze(ctx, roomID, &frozen)
-		if !waitRetry(ctx) {
+		if subscribed {
+			backoff = relayRetryBase // we did connect — a fresh death retries fast (re-homes are quick)
+		}
+		if !waitRetry(ctx, backoff) {
 			return
 		}
+		backoff = nextBackoff(backoff)
 	}
 }
 
@@ -345,9 +358,12 @@ func (c *conn) relay(ctx context.Context, roomID string, fromSeq uint64) {
 // Subscribe call until the owner's first send, which for a quiet room never comes — so spawning the
 // ephemeral relay after it would stall cursors/presence until the first commit. Starting it first
 // lets ephemerals flow immediately on join.
+// streamRoom returns the highest room_seq delivered AND whether it managed to subscribe (so the
+// supervisor resets its backoff after a real connection, but keeps backing off while no owner is
+// reachable).
 func (c *conn) streamRoom(
 	ctx context.Context, roomID string, owner aetherv1connect.RoomServiceClient, cursor uint64, frozen *bool,
-) uint64 {
+) (uint64, bool) {
 	// Pair the ephemeral relay to this attempt: re-subscribed with the event stream, torn down with it.
 	attemptCtx, attemptCancel := context.WithCancel(ctx)
 	defer attemptCancel()
@@ -358,7 +374,7 @@ func (c *conn) streamRoom(
 		RoomId: roomID, FromSeq: cursor,
 	}))
 	if err != nil {
-		return cursor
+		return cursor, false
 	}
 	defer func() { _ = stream.Close() }()
 
@@ -372,7 +388,7 @@ func (c *conn) streamRoom(
 		c.send(&aetherv1.ServerMessage{Body: &aetherv1.ServerMessage_Event{Event: ev}})
 		cursor = ev.GetRoomSeq()
 	}
-	return cursor
+	return cursor, true
 }
 
 // ephemeralRelay streams a room's live ephemerals from its owner to the client WS until the relay
@@ -418,8 +434,10 @@ func (c *conn) freeze(ctx context.Context, roomID string, frozen *bool) {
 
 // waitRetry sleeps one retry interval, returning false if ctx is cancelled meanwhile (so the relay
 // stops promptly on disconnect instead of waiting out the backoff).
-func waitRetry(ctx context.Context) bool {
-	t := time.NewTimer(relayRetryInterval)
+func waitRetry(ctx context.Context, d time.Duration) bool {
+	// Half jitter: sleep within [d/2, d] so a freed herd of watchers doesn't re-resolve in lockstep.
+	jittered := d/2 + time.Duration(rand.Int64N(int64(d/2)+1))
+	t := time.NewTimer(jittered)
 	defer t.Stop()
 	select {
 	case <-ctx.Done():
@@ -427,6 +445,18 @@ func waitRetry(ctx context.Context) bool {
 	case <-t.C:
 		return true
 	}
+}
+
+// nextBackoff doubles d up to the cap — the growth of the re-resolve interval under a sustained
+// no-owner condition.
+func nextBackoff(d time.Duration) time.Duration {
+	if d >= relayRetryCap {
+		return relayRetryCap
+	}
+	if next := d * 2; next < relayRetryCap {
+		return next
+	}
+	return relayRetryCap
 }
 
 // handleLeave stops the live relay for a room — the client no longer wants its events.
@@ -447,9 +477,13 @@ func (c *conn) handleCommit(ctx context.Context, commit *aetherv1.Commit) {
 		return
 	}
 
+	// On no-owner / transport failure, Nack the SPECIFIC commit (by client_seq) with a transient
+	// UNAVAILABLE reason — not an uncorrelated Error — so the SDK can tell a re-home blip apart from a
+	// permanent rejection and buffer + resubmit this commit when the room's relay signals LIVE again.
+	// The write-side mirror of the relay's read-side FROZEN/LIVE recovery.
 	owner, addr, err := c.srv.locator.Owner(room)
 	if err != nil {
-		c.send(errorFrame("UNAVAILABLE", "room has no reachable owner"))
+		c.send(nackFrame(room, commit.GetClientSeq(), aetherv1.NackReason_NACK_REASON_UNAVAILABLE))
 		return
 	}
 
@@ -460,10 +494,8 @@ func (c *conn) handleCommit(ctx context.Context, commit *aetherv1.Commit) {
 		Body:      commit.GetBody(),
 	}))
 	if err != nil {
-		// Not (or no longer) the owner, or a transport failure: drop the dead client and signal
-		// unavailable. Re-resolve + retry (and FROZEN) land with routing (G10).
-		c.srv.locator.Invalidate(addr)
-		c.send(errorFrame("UNAVAILABLE", "commit could not be routed to the owner"))
+		c.srv.locator.Invalidate(addr) // stale/dead owner — re-resolve on the next attempt
+		c.send(nackFrame(room, commit.GetClientSeq(), aetherv1.NackReason_NACK_REASON_UNAVAILABLE))
 		return
 	}
 	if nack := resp.Msg.GetNack(); nack != nil {
