@@ -27,6 +27,7 @@ const (
 	maxFrameBytes = 1 << 20 // per-frame read cap (1 MiB)
 	writeTimeout  = 10 * time.Second
 	outQueue      = 64 // buffered outbound frames per connection
+	opsQueue      = 64 // buffered inbound room frames awaiting the ops worker
 	pingInterval  = 30 * time.Second
 	pingTimeout   = 10 * time.Second
 )
@@ -91,24 +92,32 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		principal: principal,
 		ws:        ws,
 		out:       make(chan *aetherv1.ServerMessage, outQueue),
+		ops:       make(chan *aetherv1.ClientMessage, opsQueue),
 		rooms:     map[string]context.CancelFunc{},
 	}).run(r.Context())
 }
 
-// conn is one client WebSocket: a read loop decoding ClientMessage frames, a single writer
-// goroutine encoding ServerMessage frames (a WS permits only one concurrent writer), and a ping
-// keepalive. All three share a context that any one cancels on exit, so the whole connection tears
-// down together instead of leaking a goroutine, the socket, or the TCP conn.
+// conn is one client WebSocket: a read loop decoding ClientMessage frames, an ops worker that
+// serves room frames off the read loop, a single writer goroutine encoding ServerMessage frames (a
+// WS permits only one concurrent writer), and a ping keepalive. All share a context that any one
+// cancels on exit, so the whole connection tears down together instead of leaking a goroutine, the
+// socket, or the TCP conn.
+//
+// The read loop only decodes and ENQUEUES room frames (answering Ping inline); the ops worker
+// drains that queue and runs the handlers. This keeps the read loop draining the socket — so WS
+// keepalive and the app Ping stay responsive — even while a handler blocks on a slow owner RPC.
+// One worker preserves per-connection arrival order (a client's commits stay client_seq ordered).
 type conn struct {
 	srv       *Server
 	principal Principal
 	clientID  string // derived at Join (HMAC of principal+nonce); the dedup identity for commits
 	ws        *websocket.Conn
 	out       chan *aetherv1.ServerMessage
+	ops       chan *aetherv1.ClientMessage // decoded room frames awaiting the worker (Ping excluded)
 	cancel    context.CancelFunc
 
-	wg    sync.WaitGroup                // writeLoop + pingLoop + per-room relays
-	rooms map[string]context.CancelFunc // joined room -> its relay's cancel (read-loop goroutine only)
+	wg    sync.WaitGroup                // writeLoop + pingLoop + opsLoop + per-room relays
+	rooms map[string]context.CancelFunc // joined room -> its relay's cancel (ops-worker goroutine only)
 }
 
 func (c *conn) run(ctx context.Context) {
@@ -118,11 +127,13 @@ func (c *conn) run(ctx context.Context) {
 
 	c.ws.SetReadLimit(maxFrameBytes)
 
-	// Both background loops cancel the shared context on exit: a wedged writer or a missed pong
-	// then unblocks the read loop (and any send) rather than deadlocking it.
-	c.wg.Add(2)
+	// The background loops cancel the shared context on exit: a wedged writer or a missed pong then
+	// unblocks the read loop (and any send) rather than deadlocking it. The ops worker only exits on
+	// cancellation, so its cancel is a no-op — included for symmetry.
+	c.wg.Add(3)
 	go func() { defer c.wg.Done(); defer cancel(); c.writeLoop(ctx) }()
 	go func() { defer c.wg.Done(); defer cancel(); c.pingLoop(ctx) }()
+	go func() { defer c.wg.Done(); defer cancel(); c.opsLoop(ctx) }()
 
 	c.readLoop(ctx) // blocks until the client disconnects, errors, or the context is cancelled
 	cancel()        // stop the loops and every per-room relay (their ctxs descend from this one)
@@ -146,18 +157,45 @@ func (c *conn) readLoop(ctx context.Context) {
 			c.send(errorFrame("INVALID", "malformed ClientMessage"))
 			continue
 		}
-		c.dispatch(ctx, &m)
+		// Answer Ping INLINE so app-level keepalive stays responsive even while the worker is busy
+		// on a slow owner RPC; hand every other frame to the worker so the read loop keeps draining
+		// the socket (WS keepalive, slow-owner isolation).
+		if ping := m.GetPing(); ping != nil {
+			c.send(&aetherv1.ServerMessage{Body: &aetherv1.ServerMessage_Pong{Pong: &aetherv1.Pong{Id: ping.GetId()}}})
+			continue
+		}
+		c.enqueue(&m)
 	}
 }
 
-// dispatch handles one decoded frame. Join is served now; the remaining room frames are
-// UNIMPLEMENTED until their PRs wire the owner RPC.
+// enqueue hands a decoded room frame to the ops worker. A full queue means the client is issuing
+// ops faster than the owner can absorb them, so we disconnect it (per design §9; it resumes from
+// lastSeq on reconnect) rather than blocking the read loop and starving WS keepalive.
+func (c *conn) enqueue(m *aetherv1.ClientMessage) {
+	select {
+	case c.ops <- m:
+	default:
+		c.cancel()
+	}
+}
+
+// opsLoop serves room frames in arrival order, OFF the read loop, so a slow owner RPC (a Join
+// snapshot, a Commit) can't stall frame reading. A single worker preserves per-connection order.
+func (c *conn) opsLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case m := <-c.ops:
+			c.dispatch(ctx, m)
+		}
+	}
+}
+
+// dispatch serves one room frame on the ops worker. Ping is handled inline on the read loop, so it
+// does not appear here. The ephemeral Broadcast tier is UNIMPLEMENTED until its gateway PR (G8c).
 func (c *conn) dispatch(ctx context.Context, m *aetherv1.ClientMessage) {
 	switch b := m.GetBody().(type) {
-	case *aetherv1.ClientMessage_Ping:
-		c.send(&aetherv1.ServerMessage{
-			Body: &aetherv1.ServerMessage_Pong{Pong: &aetherv1.Pong{Id: b.Ping.GetId()}},
-		})
 	case *aetherv1.ClientMessage_Join:
 		c.handleJoin(ctx, b.Join)
 	case *aetherv1.ClientMessage_Leave:
