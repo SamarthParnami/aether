@@ -25,18 +25,20 @@ import "time"
 // Lease is a time-bound ownership token for a room.
 type Lease struct {
 	Owner  string    // node id currently holding the room
+	Addr   string    // owner's dialable RPC address, published atomically with the claim
 	Expiry time.Time // instant at which the lease lapses
 	Token  uint64    // fencing token; increments on every ownership takeover
 }
 
 // Coordinator manages room ownership and answers the directory lookup.
 type Coordinator interface {
-	// Claim attempts to acquire roomID for owner. It succeeds if the room is unowned, the
-	// existing lease has expired, or owner already holds it. A takeover (acquiring a
-	// free/expired lease) bumps the fencing token; a re-claim by the current holder keeps
-	// it. Returns the granted lease and true, or a zero lease and false when another node
-	// holds an unexpired lease.
-	Claim(roomID, owner string, now time.Time, ttl time.Duration) (Lease, bool)
+	// Claim attempts to acquire roomID for owner, publishing owner's dialable RPC address (addr)
+	// atomically with the claim — so the directory never names an owner the gateway can't reach
+	// (no "owns-but-not-dialable" window). It succeeds if the room is unowned, the existing lease
+	// has expired, or owner already holds it. A takeover (acquiring a free/expired lease) bumps the
+	// fencing token; a re-claim by the current holder keeps it and re-affirms addr. Returns the
+	// granted lease and true, or a zero lease and false when another node holds an unexpired lease.
+	Claim(roomID, owner, addr string, now time.Time, ttl time.Duration) (Lease, bool)
 
 	// Renew extends owner's lease. Returns false (ownership lost) if owner is not the
 	// current unexpired holder.
@@ -47,6 +49,7 @@ type Coordinator interface {
 	Release(roomID, owner string)
 
 	// Current returns the unexpired lease for a room: the directory lookup gateways use to
-	// route. Returns false if the room is unowned or its lease has lapsed.
+	// route, including the owner's Addr. Returns false if the room is unowned or its lease has
+	// lapsed.
 	Current(roomID string, now time.Time) (Lease, bool)
 }

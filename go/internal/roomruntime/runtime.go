@@ -47,6 +47,7 @@ var ErrNotOwner = errors.New("roomruntime: not the room owner")
 // lease; a Runtime serves only rooms whose lease it currently holds.
 type Runtime struct {
 	nodeID string
+	addr   string // this node's dialable RPC address, published with each lease claim
 	log    logstore.LogStore
 	fanout fanout.Fanout
 	coord  coord.Coordinator
@@ -67,6 +68,13 @@ type Option func(*Runtime)
 
 // WithNodeID sets this node's lease-owner identity. Each node in a cluster needs a distinct id.
 func WithNodeID(id string) Option { return func(r *Runtime) { r.nodeID = id } }
+
+// WithAddr sets this node's dialable RPC address, published into the lease on each claim so the
+// directory can route gateways to the owner. Defaults to "" (single-node / tests don't route): an
+// empty addr is a deliberately NON-routable owner, so the gateway's router must treat an empty
+// Lease.Addr as "no owner" and re-resolve, turning a misconfigured node (forgot WithAddr) into a
+// fast re-resolve rather than a silent black hole.
+func WithAddr(addr string) Option { return func(r *Runtime) { r.addr = addr } }
 
 // WithCoordinator injects the shared ownership coordinator. Nodes that can contend for the
 // same room must share one coordinator (in prod, the DynamoDB-backed impl).
@@ -200,7 +208,7 @@ func (r *Runtime) Release(roomID string) {
 // overwrite), so a zombie owner can't clobber a fresher snapshot with a stale one. We thread
 // the token into snapshot writes when snapshots are added.
 func (r *Runtime) acquire(roomID string) error {
-	if _, ok := r.coord.Claim(roomID, r.nodeID, r.now(), r.ttl); !ok {
+	if _, ok := r.coord.Claim(roomID, r.nodeID, r.addr, r.now(), r.ttl); !ok {
 		delete(r.rooms, roomID) // we no longer own it; don't serve from a stale copy
 		return ErrNotOwner
 	}

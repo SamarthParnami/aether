@@ -19,7 +19,7 @@ func NewMemory() *Memory {
 }
 
 // Claim implements Coordinator.
-func (m *Memory) Claim(roomID, owner string, now time.Time, ttl time.Duration) (Lease, bool) {
+func (m *Memory) Claim(roomID, owner, addr string, now time.Time, ttl time.Duration) (Lease, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -30,12 +30,12 @@ func (m *Memory) Claim(roomID, owner string, now time.Time, ttl time.Duration) (
 	case !held:
 		// Free (unowned or expired): take it as a fresh ownership and bump the token so any
 		// stale writes from a previous owner are fenced out.
-		l := Lease{Owner: owner, Expiry: now.Add(ttl), Token: cur.Token + 1}
+		l := Lease{Owner: owner, Addr: addr, Expiry: now.Add(ttl), Token: cur.Token + 1}
 		m.leases[roomID] = l
 		return l, true
 	case cur.Owner == owner:
-		// Re-claim by the current holder acts like a renew: extend, keep the token.
-		l := Lease{Owner: owner, Expiry: now.Add(ttl), Token: cur.Token}
+		// Re-claim by the current holder acts like a renew: extend, keep the token, re-affirm addr.
+		l := Lease{Owner: owner, Addr: addr, Expiry: now.Add(ttl), Token: cur.Token}
 		m.leases[roomID] = l
 		return l, true
 	default:
@@ -53,7 +53,9 @@ func (m *Memory) Renew(roomID, owner string, now time.Time, ttl time.Duration) (
 	if !exists || cur.Owner != owner || !now.Before(cur.Expiry) {
 		return Lease{}, false // lost
 	}
-	l := Lease{Owner: owner, Expiry: now.Add(ttl), Token: cur.Token}
+	// Keep the published Addr — the serve path re-affirms it via Claim; a future background
+	// renewal loop that wants to update addr should re-Claim rather than rely on Renew.
+	l := Lease{Owner: owner, Addr: cur.Addr, Expiry: now.Add(ttl), Token: cur.Token}
 	m.leases[roomID] = l
 	return l, true
 }
