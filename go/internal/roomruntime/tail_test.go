@@ -3,6 +3,7 @@ package roomruntime_test
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,6 +13,17 @@ import (
 	"github.com/SamarthParnami/aether/go/internal/logstore"
 	"github.com/SamarthParnami/aether/go/internal/roomruntime"
 )
+
+// countingLog wraps a LogStore and counts Read calls, to observe Tail's log-read load.
+type countingLog struct {
+	logstore.LogStore
+	reads atomic.Int64
+}
+
+func (c *countingLog) Read(ctx context.Context, roomID string, fromSeq uint64) ([]*aetherv1.Event, error) {
+	c.reads.Add(1)
+	return c.LogStore.Read(ctx, roomID, fromSeq)
+}
 
 // recvSeq receives one tailed room_seq, failing the test if none arrives promptly.
 func recvSeq(t *testing.T, ch <-chan uint64) uint64 {
@@ -193,6 +205,44 @@ func TestTailPollIntervalNonPositiveIsSafe(t *testing.T) {
 	}()
 	if s := recvSeq(t, got); s != 1 {
 		t.Fatalf("delivered %d, want 1", s)
+	}
+}
+
+// A healthy (wake-fed) stream does NO poll-driven reads: each wake resets the poll deadline, so a
+// stream getting commits faster than tailPoll re-reads only on wakes, never on the backstop timer.
+// Pins the ticker.Reset optimization — without it, the poll would add ~window/tailPoll empty reads.
+func TestTailHealthyStreamSkipsPollReads(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cl := &countingLog{LogStore: logstore.NewMemory()}
+	rt := roomruntime.New(cl, fanout.NewMemory(),
+		roomruntime.WithTailPollInterval(50*time.Millisecond))
+
+	rt.Commit(ctx, "room", "A", 1, kvBody("k", "v")) // 1 read (ensureRoom); the room is now cached
+
+	got := make(chan uint64, 64)
+	go func() {
+		_ = rt.Tail(ctx, "room", 0, func(ev *aetherv1.Event) error {
+			got <- ev.GetRoomSeq()
+			return nil
+		})
+	}()
+	recvSeq(t, got) // 1 read (Tail's initial catch-up of seq 1)
+
+	// Commit faster than tailPoll (15ms < 50ms) across several poll periods. Each wake resets the
+	// ticker, so the backstop never fires; serialising on delivery keeps it one read per wake.
+	const n = 20
+	for i := uint64(2); i <= n+1; i++ {
+		time.Sleep(15 * time.Millisecond)
+		rt.Commit(ctx, "room", "A", i, kvBody("k", "v"))
+		recvSeq(t, got)
+	}
+
+	// Expected reads: 1 (first commit's ensureRoom) + 1 (Tail initial) + one per wake (= n) ≈ n+2.
+	// Without the reset, ~window/tailPoll (≈6) extra empty poll reads would push it well past n+5.
+	if reads, limit := cl.reads.Load(), int64(n+5); reads > limit {
+		t.Fatalf("Tail did %d log reads over %d wakes; want <= %d — the poll is firing on a wake-fed stream", reads, n, limit)
 	}
 }
 
