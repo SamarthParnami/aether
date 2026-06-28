@@ -97,14 +97,40 @@ func (s *Server) Subscribe(
 	return err // a real mid-stream Send/read failure (or nil)
 }
 
-// Broadcast (the ephemeral tier) is not wired yet — it needs an ephemeral delivery path on the
-// owner and a contract addition for streaming ephemerals to gateways, which land with the
-// Broadcast PR (G8). Until then it is explicitly Unimplemented.
+// Broadcast publishes an ephemeral to the room's subscribers (the best-effort tier). It returns an
+// empty response on success; a not-owner failure is FAILED_PRECONDITION so the gateway re-resolves.
 func (s *Server) Broadcast(
-	_ context.Context, _ *connect.Request[aetherv1.BroadcastRequest],
+	ctx context.Context, req *connect.Request[aetherv1.BroadcastRequest],
 ) (*connect.Response[aetherv1.BroadcastResponse], error) {
-	return nil, connect.NewError(connect.CodeUnimplemented,
-		errors.New("ownerrpc: Broadcast (ephemeral tier) lands in a later PR"))
+	m := req.Msg
+	switch err := s.rt.Broadcast(ctx, m.GetRoomId(), m.GetOriginClientId(), m.GetBody()); {
+	case errors.Is(err, roomruntime.ErrNotOwner):
+		return nil, connect.NewError(connect.CodeFailedPrecondition, err)
+	case err != nil:
+		return nil, connect.NewError(connect.CodeInternal, err)
+	}
+	return connect.NewResponse(&aetherv1.BroadcastResponse{}), nil
+}
+
+// SubscribeEphemeral streams a room's live ephemerals by piping Runtime.TailEphemeral to the
+// stream. It mirrors Subscribe's disconnect handling: a cancelled context is a clean end (not a
+// failed stream), and a not-owner is FAILED_PRECONDITION so the gateway re-resolves. There is no
+// OUT_OF_RANGE path — the ephemeral tier has no history to fall off.
+func (s *Server) SubscribeEphemeral(
+	ctx context.Context, req *connect.Request[aetherv1.SubscribeEphemeralRequest],
+	stream *connect.ServerStream[aetherv1.SubscribeEphemeralResponse],
+) error {
+	err := s.rt.TailEphemeral(ctx, req.Msg.GetRoomId(), func(e *aetherv1.Ephemeral) error {
+		return stream.Send(&aetherv1.SubscribeEphemeralResponse{Ephemeral: e})
+	})
+
+	if ctx.Err() != nil {
+		return nil
+	}
+	if errors.Is(err, roomruntime.ErrNotOwner) {
+		return connect.NewError(connect.CodeFailedPrecondition, err)
+	}
+	return err
 }
 
 var _ aetherv1connect.RoomServiceHandler = (*Server)(nil)

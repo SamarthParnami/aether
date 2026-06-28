@@ -39,6 +39,14 @@ service RoomService {
 
   // Broadcast fans an ephemeral (lossy, unordered, no-ack) message to room subscribers.
   rpc Broadcast(BroadcastRequest) returns (BroadcastResponse);
+
+  // SubscribeEphemeral streams a room's ephemeral messages (cursors, presence, "typing…",
+  // reactions) live from the owner. Unlike Subscribe, this tier is best-effort: ephemerals are
+  // never persisted, so there is no replay/catch-up and no from_seq — a subscriber receives only
+  // ephemerals broadcast AFTER it subscribes, and a slow subscriber's overflow is dropped, not
+  // queued. It is a SEPARATE stream from Subscribe so an ephemeral flood cannot backpressure or
+  // reorder committed events (05-design-gateway.md G8, Option B).
+  rpc SubscribeEphemeral(SubscribeEphemeralRequest) returns (stream SubscribeEphemeralResponse);
 }
 
 message CommitRequest {
@@ -91,3 +99,12 @@ message BroadcastRequest {
 }
 
 message BroadcastResponse {}
+
+message SubscribeEphemeralRequest {
+  string room_id = 1;
+}
+
+// SubscribeEphemeralResponse wraps a single streamed Ephemeral (named per the RPC for buf lint).
+message SubscribeEphemeralResponse {
+  Ephemeral ephemeral = 1;
+}
