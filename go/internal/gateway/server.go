@@ -10,6 +10,7 @@ package gateway
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -29,10 +30,14 @@ const (
 	pingTimeout   = 10 * time.Second
 )
 
-// defaultClientIDSecret is a DEV-ONLY HMAC key for client_id derivation. Production must inject a
-// real cluster-wide secret via WithClientIDSecret — every gateway must share it so a reconnect to
-// any gateway derives the same id.
-var defaultClientIDSecret = []byte("aether-dev-client-id-secret")
+// defaultClientIDSecret is a DEV-ONLY HMAC key for client_id derivation, used only when no secret
+// is injected. Production must set a real cluster-wide secret via WithClientIDSecret — every
+// gateway must share it so a reconnect to any gateway derives the same id. Its use is warned about
+// once at startup so a forgotten injection is caught, not silently shipped.
+var (
+	defaultClientIDSecret = []byte("aether-dev-client-id-secret")
+	devSecretWarnOnce     sync.Once
+)
 
 // Server is an http.Handler that upgrades requests to the Aether client WebSocket and serves the
 // room protocol against owners resolved through the locator.
@@ -53,9 +58,17 @@ func WithClientIDSecret(secret []byte) ServerOption { return func(s *Server) { s
 // NewServer returns a gateway WebSocket server: it authenticates handshakes with auth and routes
 // room traffic to owners via locator.
 func NewServer(auth Authenticator, locator *OwnerLocator, opts ...ServerOption) *Server {
-	s := &Server{auth: auth, locator: locator, secret: defaultClientIDSecret}
+	s := &Server{auth: auth, locator: locator}
 	for _, opt := range opts {
 		opt(s)
+	}
+	if s.secret == nil {
+		// Fail loud, not silent: a prod gateway that forgot WithClientIDSecret would otherwise
+		// derive ids under a publicly-known key. (Once per process so tests don't spam.)
+		devSecretWarnOnce.Do(func() {
+			log.Println("gateway: WARNING using the DEV client_id secret; set WithClientIDSecret(<cluster secret>) in production")
+		})
+		s.secret = defaultClientIDSecret
 	}
 	return s
 }
@@ -153,6 +166,13 @@ func (c *conn) dispatch(ctx context.Context, m *aetherv1.ClientMessage) {
 // the current snapshot, and reply Joined. (Live event relay and resume catch-up land next, in
 // G6b/G9; FROZEN/retry on no-owner lands with routing, G10.)
 func (c *conn) handleJoin(ctx context.Context, join *aetherv1.Join) {
+	if join.GetSessionNonce() == "" {
+		// Without a nonce, all of a principal's sessions collapse onto one client_id and their
+		// client_seq counters collide in the owner's dedup space — silently dropping commits. Make
+		// the session-separation contract a server-enforced requirement, not a client courtesy.
+		c.send(errorFrame("INVALID", "session_nonce required"))
+		return
+	}
 	clientID := deriveClientID(c.srv.secret, c.principal.ID, join.GetSessionNonce())
 
 	owner, _, err := c.srv.locator.Owner(join.GetRoomId())

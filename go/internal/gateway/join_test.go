@@ -56,6 +56,30 @@ func TestJoinReturnsIdentityAndSnapshot(t *testing.T) {
 	}
 }
 
+// A Join without a session_nonce is rejected — an empty nonce would collapse a principal's sessions
+// onto one client_id and silently drop their commits, so the requirement is enforced server-side.
+func TestJoinEmptyNonceRejected(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	gw := httptest.NewServer(gateway.NewServer(
+		gateway.DevAuthenticator{Header: authHeader},
+		gateway.NewOwnerLocator(coord.NewMemory()),
+	))
+	defer gw.Close()
+
+	ws := dial(ctx, t, gw, "user-1")
+	defer func() { _ = ws.Close(websocket.StatusNormalClosure, "") }()
+
+	writeFrame(ctx, t, ws, &aetherv1.ClientMessage{Body: &aetherv1.ClientMessage_Join{Join: &aetherv1.Join{
+		RoomId: "room", // no SessionNonce
+	}}})
+
+	if code := readFrame(ctx, t, ws).GetError().GetCode(); code != "INVALID" {
+		t.Fatalf("error code = %q, want INVALID", code)
+	}
+}
+
 // A Join to a room with no reachable owner yields an error frame (FROZEN/retry lands with routing).
 func TestJoinNoOwnerErrors(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
