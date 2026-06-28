@@ -108,6 +108,7 @@ enum NackReason {
   NACK_REASON_INVALID = 3;
   NACK_REASON_RATE_LIMITED = 4;
   NACK_REASON_NOT_JOINED = 5;
+  NACK_REASON_UNAVAILABLE = 6; // no reachable owner / re-homing — transient; resubmit on RoomStatus LIVE
 }
 
 message RoomStatus {

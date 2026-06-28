@@ -31,6 +31,15 @@ func kvBody(key, val string) *aetherv1.EventBody {
 // relay-death tests). Binding the listener first lets the runtime publish its own addr (WithAddr)
 // into the shared coordinator on claim. The server is also closed on test cleanup.
 func startOwner(t *testing.T, co coord.Coordinator, nodeID string) (*roomruntime.Runtime, func()) {
+	return startOwnerWithLog(t, co, logstore.NewMemory(), nodeID)
+}
+
+// startOwnerWithLog is startOwner over a CALLER-PROVIDED log, so two nodes can share one durable log
+// (and coordinator) — the setup a failover test needs: kill the owner, and a survivor on the same
+// log re-homes the room and replays it.
+func startOwnerWithLog(
+	t *testing.T, co coord.Coordinator, log logstore.LogStore, nodeID string,
+) (*roomruntime.Runtime, func()) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -38,7 +47,7 @@ func startOwner(t *testing.T, co coord.Coordinator, nodeID string) (*roomruntime
 	}
 	addr := ln.Addr().String()
 
-	rt := roomruntime.New(logstore.NewMemory(), fanout.NewMemory(),
+	rt := roomruntime.New(log, fanout.NewMemory(),
 		roomruntime.WithNodeID(nodeID),
 		roomruntime.WithAddr(addr),
 		roomruntime.WithCoordinator(co),
