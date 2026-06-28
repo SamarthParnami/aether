@@ -43,7 +43,13 @@ type Fanout interface {
 //
 // Keeping it a SEPARATE bus from the durable event Fanout is deliberate (05-design-gateway.md G8,
 // Option B): the owner stays the room's single hub, but ephemeral traffic gets its own delivery
-// path so a cursor flood cannot backpressure or reorder real committed events.
+// path so a cursor flood cannot backpressure or reorder real committed events AT THE OWNER.
+//
+// This separation must be carried THROUGH the gateway or it is undone: both tiers' relays feed a
+// client's single bounded out-queue (whose slow-client overflow disconnects the conn), so a cursor
+// flood would crowd events out of that shared queue or trip the disconnect — re-coupling the two
+// paths at the socket. So G8c's ephemeral relay must drop/coalesce ephemerals under out-queue
+// pressure (design §9 — "ephemerals dropped first") rather than contend equally with events.
 type EphemeralFanout interface {
 	// Publish delivers eph to every current subscriber of roomID. Best-effort: no ack, no dedup,
 	// no ordering guarantee across publishers.
