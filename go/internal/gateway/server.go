@@ -20,6 +20,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	aetherv1 "github.com/SamarthParnami/aether/go/gen/aether/v1"
+	"github.com/SamarthParnami/aether/go/gen/aether/v1/aetherv1connect"
 )
 
 const (
@@ -90,6 +91,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		principal: principal,
 		ws:        ws,
 		out:       make(chan *aetherv1.ServerMessage, outQueue),
+		rooms:     map[string]context.CancelFunc{},
 	}).run(r.Context())
 }
 
@@ -103,6 +105,9 @@ type conn struct {
 	ws        *websocket.Conn
 	out       chan *aetherv1.ServerMessage
 	cancel    context.CancelFunc
+
+	wg    sync.WaitGroup                // writeLoop + pingLoop + per-room relays
+	rooms map[string]context.CancelFunc // joined room -> its relay's cancel (read-loop goroutine only)
 }
 
 func (c *conn) run(ctx context.Context) {
@@ -114,14 +119,13 @@ func (c *conn) run(ctx context.Context) {
 
 	// Both background loops cancel the shared context on exit: a wedged writer or a missed pong
 	// then unblocks the read loop (and any send) rather than deadlocking it.
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); defer cancel(); c.writeLoop(ctx) }()
-	go func() { defer wg.Done(); defer cancel(); c.pingLoop(ctx) }()
+	c.wg.Add(2)
+	go func() { defer c.wg.Done(); defer cancel(); c.writeLoop(ctx) }()
+	go func() { defer c.wg.Done(); defer cancel(); c.pingLoop(ctx) }()
 
 	c.readLoop(ctx) // blocks until the client disconnects, errors, or the context is cancelled
-	cancel()        // ensure the loops stop even on a clean read-side close
-	wg.Wait()
+	cancel()        // stop the loops and every per-room relay (their ctxs descend from this one)
+	c.wg.Wait()     // writeLoop + pingLoop + relays all drained before we close the socket
 	_ = c.ws.Close(websocket.StatusNormalClosure, "")
 }
 
@@ -155,7 +159,9 @@ func (c *conn) dispatch(ctx context.Context, m *aetherv1.ClientMessage) {
 		})
 	case *aetherv1.ClientMessage_Join:
 		c.handleJoin(ctx, b.Join)
-	case *aetherv1.ClientMessage_Commit, *aetherv1.ClientMessage_Broadcast, *aetherv1.ClientMessage_Leave:
+	case *aetherv1.ClientMessage_Leave:
+		c.handleLeave(b.Leave)
+	case *aetherv1.ClientMessage_Commit, *aetherv1.ClientMessage_Broadcast:
 		c.send(errorFrame("UNIMPLEMENTED", "room handling lands in a later gateway PR"))
 	default:
 		c.send(errorFrame("INVALID", "empty or unknown frame"))
@@ -195,6 +201,62 @@ func (c *conn) handleJoin(ctx context.Context, join *aetherv1.Join) {
 		CurrentSeq: resp.Msg.GetRoomSeq(),
 		Snapshot:   &aetherv1.Snapshot{RoomSeq: resp.Msg.GetRoomSeq(), State: resp.Msg.GetState()},
 	}}})
+
+	// Relay live events from just after the snapshot — no gap (Subscribe replays from from_seq),
+	// no dup (snapshot is state ≤ room_seq, the stream is events > room_seq). A re-Join replaces
+	// the prior relay.
+	if cancel, ok := c.rooms[join.GetRoomId()]; ok {
+		cancel()
+	}
+	relayCtx, cancel := context.WithCancel(ctx)
+	c.rooms[join.GetRoomId()] = cancel
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		c.relay(relayCtx, join.GetRoomId(), owner, resp.Msg.GetRoomSeq())
+	}()
+}
+
+// relay streams a room's events from its owner and forwards them to the client WS, until the relay
+// context is cancelled (client disconnect or Leave) or the owner stream ends. If the stream dies
+// for an owner-side reason (owner death — not the client leaving), it signals RoomStatus{FROZEN} so
+// the client knows its live feed dropped and can re-Join, rather than freezing silently. (Automatic
+// re-resolve + re-subscribe on owner failover lands with routing, G10; an owner *re-home* with the
+// owner still alive is already covered — the owner's Tail self-heals via its poll-ticker.)
+func (c *conn) relay(ctx context.Context, roomID string, owner aetherv1connect.RoomServiceClient, fromSeq uint64) {
+	stream, err := owner.Subscribe(ctx, connect.NewRequest(&aetherv1.SubscribeRequest{
+		RoomId: roomID, FromSeq: fromSeq,
+	}))
+	if err != nil {
+		c.signalRoomFrozen(ctx, roomID)
+		return
+	}
+	defer func() { _ = stream.Close() }()
+	for stream.Receive() {
+		c.send(&aetherv1.ServerMessage{Body: &aetherv1.ServerMessage_Event{Event: stream.Msg().GetEvent()}})
+	}
+	c.signalRoomFrozen(ctx, roomID)
+}
+
+// signalRoomFrozen tells the client a room's live feed dropped — but only when the relay died for
+// an owner-side reason. A cancelled relay context means the client left or disconnected (a clean
+// end), so nothing is sent.
+func (c *conn) signalRoomFrozen(ctx context.Context, roomID string) {
+	if ctx.Err() != nil {
+		return
+	}
+	c.send(&aetherv1.ServerMessage{Body: &aetherv1.ServerMessage_RoomStatus{RoomStatus: &aetherv1.RoomStatus{
+		RoomId: roomID,
+		Status: aetherv1.RoomStatus_STATUS_FROZEN,
+	}}})
+}
+
+// handleLeave stops the live relay for a room — the client no longer wants its events.
+func (c *conn) handleLeave(leave *aetherv1.Leave) {
+	if cancel, ok := c.rooms[leave.GetRoomId()]; ok {
+		cancel()
+		delete(c.rooms, leave.GetRoomId())
+	}
 }
 
 // writeLoop is the sole writer: it drains the outbound queue to the socket.
