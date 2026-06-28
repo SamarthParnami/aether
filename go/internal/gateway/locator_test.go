@@ -27,9 +27,10 @@ func kvBody(key, val string) *aetherv1.EventBody {
 }
 
 // startOwner brings up an owner node — a roomruntime.Runtime serving the RoomService RPC on a real
-// loopback listener — and returns its runtime and dialable addr. Binding the listener first lets the
-// runtime publish its own addr (WithAddr) into the shared coordinator on claim.
-func startOwner(t *testing.T, co coord.Coordinator, nodeID string) *roomruntime.Runtime {
+// loopback listener — and returns its runtime plus a stop func to kill the node (for failover /
+// relay-death tests). Binding the listener first lets the runtime publish its own addr (WithAddr)
+// into the shared coordinator on claim. The server is also closed on test cleanup.
+func startOwner(t *testing.T, co coord.Coordinator, nodeID string) (*roomruntime.Runtime, func()) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -46,8 +47,9 @@ func startOwner(t *testing.T, co coord.Coordinator, nodeID string) *roomruntime.
 	mux.Handle(aetherv1connect.NewRoomServiceHandler(ownerrpc.NewServer(rt)))
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() { _ = srv.Serve(ln) }()
-	t.Cleanup(func() { _ = srv.Close() })
-	return rt
+	stop := func() { _ = srv.Close() }
+	t.Cleanup(stop)
+	return rt, stop
 }
 
 // The locator resolves a room to its owner via the coord directory and dials it — an end-to-end
@@ -55,7 +57,7 @@ func startOwner(t *testing.T, co coord.Coordinator, nodeID string) *roomruntime.
 func TestLocatorResolvesAndDialsOwner(t *testing.T) {
 	ctx := context.Background()
 	co := coord.NewMemory()
-	rt := startOwner(t, co, "owner")
+	rt, _ := startOwner(t, co, "owner")
 
 	// The owner claims (publishing its addr into the directory) by serving a commit.
 	if _, applied, err := rt.Commit(ctx, "room", "A", 1, kvBody("slide", "7")); err != nil || !applied {
