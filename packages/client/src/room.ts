@@ -189,9 +189,21 @@ export class Room {
     this.send({ case: 'broadcast', value: { roomId: this.roomId, body } });
   }
 
-  /** App-level keepalive/RTT probe: resolves when the matching Pong returns. */
+  /**
+   * App-level keepalive/RTT probe: resolves when the matching Pong returns, rejects if the connection
+   * drops first. `id` must be unique among in-flight pings (a duplicate rejects rather than orphaning
+   * the earlier waiter), and there must be a live transport.
+   */
   ping(id: string): Promise<void> {
     return new Promise<void>((resolve, reject) => {
+      if (this.pings.has(id)) {
+        reject(new Error(`ping id ${id} already in flight`));
+        return;
+      }
+      if (!this.transport) {
+        reject(new Error('ping: not connected'));
+        return;
+      }
       this.pings.set(id, { resolve, reject });
       this.send({ case: 'ping', value: { id } });
     });
@@ -289,14 +301,18 @@ export class Room {
     this.reconnectAttempt = 0; // a successful join resets backoff
     if (j.snapshot) {
       // Fresh join, or a deep resume where our cursor fell below the log's floor: adopt the snapshot
-      // wholesale as the new base.
+      // wholesale as the new base. Copy each value (protobuf-es decodes `bytes` as a view aliasing the
+      // frame buffer) — matching the reducer's `fold`, so snapshot and folded state behave identically.
       this.state = emptyState();
-      for (const [k, v] of Object.entries(j.snapshot.state?.entries ?? {})) this.state.set(k, v);
+      for (const [k, v] of Object.entries(j.snapshot.state?.entries ?? {}))
+        this.state.set(k, v.slice());
+      // The cursor is exactly the snapshot's materialized point. We deliberately do NOT advance it to
+      // j.current_seq: current_seq can be the log head, ahead of the snapshot, and the relay streams
+      // the events between them — jumping the cursor there would silently drop that backfill.
       this.cursor = j.snapshot.roomSeq;
     }
     // No snapshot ⇒ a resume from our cursor: keep the state we already have; the gateway streams the
     // events after `cursor` to backfill.
-    if (j.currentSeq > this.cursor) this.cursor = j.currentSeq;
     this.setLive(true);
     this.bump();
     this.joinWaiter?.resolve(); // resolves the first connect(); a no-op on later reconnects
@@ -306,8 +322,11 @@ export class Room {
 
   private onEvent(e: Event): void {
     if (e.roomId !== this.roomId) return;
-    // Fan-out is the ack: our own committed event returning resolves the outstanding commit — whether
-    // a live delivery or a replay during recovery (so an already-applied commit still acks).
+    // Fan-out is the ack: our own committed event returning resolves the outstanding commit. This runs
+    // BEFORE the replay/gap gates below on purpose — the ack signals DURABILITY (the commit is in the
+    // log), not local materialization. So an already-applied commit replayed during recovery still
+    // acks even though its room_seq ≤ cursor, and a deep-resume that re-fans a subsumed commit resolves
+    // it too. Local state may briefly lag the ack in a gap; the cursor-resume backfill reconciles it.
     if (e.originClientId === this.clientIdValue) this.ackCommit(e.originClientSeq);
 
     const expected = this.cursor + 1n;

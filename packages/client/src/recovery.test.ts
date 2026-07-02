@@ -146,7 +146,7 @@ describe('Room recovery', () => {
 
     await waitForServer(servers, 1);
     await recvClient(serverAt(servers, 0));
-    sendServer(serverAt(servers, 0), joinedResume(2n));
+    sendServer(serverAt(servers, 0), joinedSnapshot(2n, {})); // fresh join establishes the cursor
     await connected;
 
     const done = room.commit(kvBody('a', '1'));
@@ -157,5 +157,87 @@ describe('Room recovery', () => {
     // No reconnect after a user close, even across a tick.
     await new Promise((r) => setTimeout(r, 0));
     expect(servers).toHaveLength(1);
+  });
+
+  it('buffers a commit issued while disconnected and sends it on reconnect', async () => {
+    const { dial, servers } = harness();
+    const room = new Room({ dial, roomId: 'r', sessionNonce: 'n', reconnectDelayMs: () => 0 });
+    const connected = room.connect();
+
+    await waitForServer(servers, 1);
+    await recvClient(serverAt(servers, 0));
+    sendServer(serverAt(servers, 0), joinedSnapshot(2n, {}));
+    await connected;
+
+    // Drop, THEN commit — while there is no live connection. The commit must not be lost.
+    serverAt(servers, 0).close(new Error('drop'));
+    const done = room.commit(kvBody('x', '1'));
+
+    await waitForServer(servers, 2);
+    expect(fromSeqOf(await recvClient(serverAt(servers, 1)))).toBe(2n);
+    sendServer(serverAt(servers, 1), joinedResume(2n));
+    expect(commitSeqOf(await recvClient(serverAt(servers, 1)))).toBe(1n); // sent on reconnect
+    sendServer(serverAt(servers, 1), ackEvent(3n, 1n, 'x', '1'));
+    await expect(done).resolves.toBeUndefined();
+
+    room.close();
+  });
+
+  it('grows the reconnect backoff attempt across consecutive failed reconnects', async () => {
+    const { dial, servers } = harness();
+    const attempts: number[] = [];
+    const room = new Room({
+      dial,
+      roomId: 'r',
+      sessionNonce: 'n',
+      reconnectDelayMs: (a) => {
+        attempts.push(a);
+        return 0;
+      },
+    });
+    const connected = room.connect();
+
+    await waitForServer(servers, 1);
+    await recvClient(serverAt(servers, 0));
+    sendServer(serverAt(servers, 0), joinedSnapshot(0n, {})); // first join resets the attempt counter
+    await connected;
+
+    // Each reconnect is dropped before its Joined, so the attempt counter is never reset → it grows.
+    for (let i = 0; i < 3; i++) {
+      serverAt(servers, i).close(new Error('drop'));
+      await waitForServer(servers, i + 2);
+      await recvClient(serverAt(servers, i + 1)); // consume the reconnect Join, send no Joined
+    }
+
+    expect(attempts).toEqual([0, 1, 2]); // reconnectDelayMs consulted with a growing attempt
+    room.close();
+  });
+
+  it('resolves an outstanding commit subsumed by a deep-resume snapshot (ack via re-fanout)', async () => {
+    const { dial, servers } = harness();
+    const room = new Room({ dial, roomId: 'r', sessionNonce: 'n', reconnectDelayMs: () => 0 });
+    const connected = room.connect();
+
+    await waitForServer(servers, 1);
+    await recvClient(serverAt(servers, 0));
+    sendServer(serverAt(servers, 0), joinedSnapshot(2n, { slide: '7' }));
+    await connected;
+
+    const done = room.commit(kvBody('slide', '9')); // applies at owner as room_seq 3, but the ack is lost
+    expect(commitSeqOf(await recvClient(serverAt(servers, 0)))).toBe(1n);
+    serverAt(servers, 0).close(new Error('drop'));
+
+    await waitForServer(servers, 2);
+    expect(fromSeqOf(await recvClient(serverAt(servers, 1)))).toBe(2n);
+    // Deep resume: our cursor fell below the floor → a fresh snapshot at 5 (already includes our write).
+    sendServer(serverAt(servers, 1), joinedSnapshot(5n, { slide: '9' }));
+    expect(commitSeqOf(await recvClient(serverAt(servers, 1)))).toBe(1n); // resent…
+    // …the owner dedups (already applied) and RE-FANS the subsumed event; ack-before-gate resolves it
+    // even though room_seq 3 ≤ cursor 5.
+    sendServer(serverAt(servers, 1), ackEvent(3n, 1n, 'slide', '9'));
+    await expect(done).resolves.toBeUndefined();
+    expect(room.currentSeq()).toBe(5n); // cursor stays at the snapshot; the replay didn't move it
+
+    room.close();
   });
 });

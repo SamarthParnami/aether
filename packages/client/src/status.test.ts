@@ -30,9 +30,14 @@ async function recvClient(server: ServerEnd): Promise<ClientMessage> {
 }
 const commitSeqOf = (m: ClientMessage) => (m.body.case === 'commit' ? m.body.value.clientSeq : -1n);
 
-function joinedResume(cursor: bigint): ServerMessage {
+// A fresh join carrying a snapshot at `cursor` (the real fresh-join shape: the cursor is the
+// snapshot's materialized point, not current_seq).
+function joinedFresh(cursor: bigint): ServerMessage {
   return create(ServerMessageSchema, {
-    body: { case: 'joined', value: { roomId: 'r', clientId: 'c1', currentSeq: cursor } },
+    body: {
+      case: 'joined',
+      value: { roomId: 'r', clientId: 'c1', currentSeq: cursor, snapshot: { roomSeq: cursor } },
+    },
   });
 }
 function statusMsg(status: RoomStatus_Status): ServerMessage {
@@ -61,7 +66,7 @@ async function joinedRoom(opts: Partial<RoomOptions>): Promise<{ room: Room; ser
   const room = new Room({ dial: () => transport, roomId: 'r', sessionNonce: 'n', ...opts });
   const connected = room.connect();
   await recvClient(server);
-  sendServer(server, joinedResume(2n));
+  sendServer(server, joinedFresh(2n));
   await connected;
   return { room, server };
 }

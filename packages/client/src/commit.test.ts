@@ -169,4 +169,69 @@ describe('Room commit path', () => {
     room.close();
     await expect(done).rejects.toThrow(/room closed/);
   });
+
+  it('ignores an Ephemeral with no body or a mismatched room', async () => {
+    const seen: string[] = [];
+    const { room, server } = await joinedRoom({
+      onEphemeral: (_id, body) => {
+        if (body.kind.case === 'kvSet') seen.push(dec(body.kind.value.value) ?? '');
+      },
+    });
+
+    // No body → skipped.
+    sendServer(
+      server,
+      create(ServerMessageSchema, {
+        body: { case: 'ephemeral', value: { roomId: 'r', originClientId: 'peer' } },
+      }),
+    );
+    // Wrong room → skipped.
+    sendServer(
+      server,
+      create(ServerMessageSchema, {
+        body: {
+          case: 'ephemeral',
+          value: { roomId: 'other', originClientId: 'peer', body: kvEph('c', '1') },
+        },
+      }),
+    );
+    // A valid one → delivered, proving the stream still flows past the skipped frames.
+    sendServer(
+      server,
+      create(ServerMessageSchema, {
+        body: {
+          case: 'ephemeral',
+          value: { roomId: 'r', originClientId: 'peer', body: kvEph('c', '9') },
+        },
+      }),
+    );
+
+    await vi.waitFor(() => expect(seen).toEqual(['9']));
+    room.close();
+  });
+
+  it('ignores a Nack for an unknown client_seq (no throw, no effect on other commits)', async () => {
+    const { room, server } = await joinedRoom();
+    const done = room.commit(kvBody('a', '1')); // client_seq 1
+    await recvClient(server);
+
+    sendServer(server, nackMsg(999n, NackReason.INVALID)); // unknown seq → no-op
+    sendServer(server, ackEvent(3n, 1n, 'a', '1')); // the real commit still acks
+    await expect(done).resolves.toBeUndefined();
+    room.close();
+  });
+
+  it('does not double-resolve on a duplicate fan-out of the same commit', async () => {
+    const { room, server } = await joinedRoom();
+    let resolves = 0;
+    const done = room.commit(kvBody('a', '1')).then(() => resolves++);
+    await recvClient(server);
+
+    sendServer(server, ackEvent(3n, 1n, 'a', '1')); // ack
+    sendServer(server, ackEvent(3n, 1n, 'a', '1')); // duplicate fan-out → must be a no-op
+    await done;
+    await new Promise((r) => setTimeout(r, 0));
+    expect(resolves).toBe(1);
+    room.close();
+  });
 });
