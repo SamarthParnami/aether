@@ -159,11 +159,13 @@ describe('Room commit path', () => {
     await vi.waitFor(() => expect(seen).toContain('5'));
   });
 
-  it('rejects an in-flight commit when the connection closes', async () => {
+  it('rejects an in-flight commit when the room is closed by the user', async () => {
+    // A transport drop does NOT reject a commit (recovery re-sends it — see recovery.test.ts); only
+    // an explicit close() is terminal.
     const { room, server } = await joinedRoom();
     const done = room.commit(kvBody('a', '1'));
     await recvClient(server);
-    server.close(new Error('gone'));
-    await expect(done).rejects.toThrow(/gone/);
+    room.close();
+    await expect(done).rejects.toThrow(/room closed/);
   });
 });
