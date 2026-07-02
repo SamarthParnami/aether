@@ -7,17 +7,26 @@
  * the two in lockstep) — and notifies subscribers. `getState()`/`subscribe()` are the useState-like
  * surface the React hook (S5) builds on.
  *
- * This PR (S2) covers Join → snapshot → live Events + request/response Ping. Committing (S3) and
- * reconnect/recovery (S4) layer on; until S4 a dropped connection just rejects in-flight promises
- * (no auto-reconnect yet), and a room_seq gap is surfaced, never applied out of order.
+ * Writing: `commit()` assigns a per-client monotonic `client_seq`, buffers the commit, and resolves
+ * when the committed Event fans back to us — "fan-out is the ack". `(client_id, client_seq)` is the
+ * dedup key, so a resend of an already-applied commit is a no-op on the server. `broadcast()` is the
+ * lossy ephemeral tier: no ack, no dedup, no ordering.
+ *
+ * This PR (S3) covers commit/ack/Nack + broadcast. Reconnect/recovery (S4) layers on; until then a
+ * dropped connection rejects everything in flight (no auto-reconnect), and a room_seq gap is
+ * surfaced, never applied out of order.
  */
 import {
   ClientMessageSchema,
   emptyState,
+  type EphemeralBody,
   type Event,
+  type EventBody,
   fold,
   type Joined,
   type MaterializedState,
+  type Nack,
+  NackReason,
   type ServerMessage,
 } from '@aether/protocol';
 import { create } from '@bufbuild/protobuf';
@@ -37,14 +46,28 @@ export interface RoomOptions {
   sessionNonce?: string;
   /** Invoked on a server Error frame, or when a room_seq gap is detected (code `seq_gap`). */
   onError?: (code: string, message: string) => void;
+  /** Invoked for each received Ephemeral (another client's broadcast). Lossy — best-effort only. */
+  onEphemeral?: (originClientId: string, body: EphemeralBody) => void;
 }
 
 /** Notified after each applied state change; read the latest via {@link Room.getState}. */
 export type StateListener = () => void;
 
+/** Rejection of a {@link Room.commit} the server refused, carrying the wire {@link NackReason}. */
+export class NackError extends Error {
+  constructor(readonly reason: NackReason) {
+    super(`commit rejected: ${NackReason[reason] ?? String(reason)}`);
+    this.name = 'NackError';
+  }
+}
+
 interface Waiter {
   resolve: () => void;
   reject: (err: Error) => void;
+}
+
+interface Outstanding extends Waiter {
+  body: EventBody; // retained for the recovery resend (S4)
 }
 
 export class Room {
@@ -52,15 +75,18 @@ export class Room {
   private readonly roomId: string;
   private readonly nonce: string;
   private readonly onError: ((code: string, message: string) => void) | undefined;
+  private readonly onEphemeral: ((originClientId: string, body: EphemeralBody) => void) | undefined;
 
   private transport: Transport | undefined;
   private state: MaterializedState = emptyState();
   private cursor = 0n; // highest applied room_seq
   private version = 0; // bumped on every state change — the useSyncExternalStore snapshot (S5)
   private clientIdValue: string | undefined;
+  private clientSeq = 0n; // last assigned per-client commit sequence
 
   private joinWaiter: Waiter | undefined;
   private readonly pings = new Map<string, Waiter>();
+  private readonly outstanding = new Map<bigint, Outstanding>(); // client_seq → un-acked commit
   private readonly listeners = new Set<StateListener>();
 
   constructor(opts: RoomOptions) {
@@ -68,6 +94,7 @@ export class Room {
     this.roomId = opts.roomId;
     this.nonce = opts.sessionNonce ?? crypto.randomUUID();
     this.onError = opts.onError;
+    this.onEphemeral = opts.onEphemeral;
   }
 
   /** Dial, Join from a fresh cursor, and resolve when the gateway replies Joined. */
@@ -111,6 +138,32 @@ export class Room {
     return () => this.listeners.delete(fn);
   }
 
+  /**
+   * Commit a durable event. Resolves when the committed Event fans back to us (fan-out is the ack);
+   * rejects with a {@link NackError} if the server refuses it (except `UNAVAILABLE`, which is
+   * transient — the commit stays buffered for the recovery resend in S4). Assigns the next
+   * per-client `client_seq`, which together with `client_id` is the server's exactly-once dedup key.
+   */
+  commit(body: EventBody): Promise<void> {
+    this.clientSeq += 1n;
+    const seq = this.clientSeq;
+    return new Promise<void>((resolve, reject) => {
+      this.outstanding.set(seq, { body, resolve, reject });
+      this.sendCommit(seq, body);
+    });
+  }
+
+  /** Fire-and-forget an ephemeral broadcast (cursors, presence): lossy, unordered, never acked. */
+  broadcast(body: EphemeralBody): void {
+    this.transport?.send(
+      encodeClientMessage(
+        create(ClientMessageSchema, {
+          body: { case: 'broadcast', value: { roomId: this.roomId, body } },
+        }),
+      ),
+    );
+  }
+
   /** App-level keepalive/RTT probe: resolves when the matching Pong returns. */
   ping(id: string): Promise<void> {
     return new Promise<void>((resolve, reject) => {
@@ -139,6 +192,16 @@ export class Room {
     );
   }
 
+  private sendCommit(clientSeq: bigint, body: EventBody): void {
+    this.transport?.send(
+      encodeClientMessage(
+        create(ClientMessageSchema, {
+          body: { case: 'commit', value: { roomId: this.roomId, clientSeq, body } },
+        }),
+      ),
+    );
+  }
+
   private handle(m: ServerMessage): void {
     switch (m.body.case) {
       case 'joined':
@@ -146,6 +209,14 @@ export class Room {
         break;
       case 'event':
         this.onEvent(m.body.value);
+        break;
+      case 'nack':
+        this.onNack(m.body.value);
+        break;
+      case 'ephemeral':
+        if (m.body.value.roomId === this.roomId && m.body.value.body) {
+          this.onEphemeral?.(m.body.value.originClientId, m.body.value.body);
+        }
         break;
       case 'pong': {
         const w = this.pings.get(m.body.value.id);
@@ -158,7 +229,7 @@ export class Room {
       case 'error':
         this.onError?.(m.body.value.code, m.body.value.message);
         break;
-      // nack / ephemeral / roomStatus arrive with the commit (S3) and recovery (S4) layers.
+      // roomStatus (FROZEN/LIVE) drives the recovery layer in S4.
       default:
         break;
     }
@@ -180,6 +251,10 @@ export class Room {
 
   private onEvent(e: Event): void {
     if (e.roomId !== this.roomId) return;
+    // Fan-out is the ack: our own committed event returning resolves the outstanding commit — whether
+    // it's a live delivery or a replay during recovery (so an already-applied commit still acks).
+    if (e.originClientId === this.clientIdValue) this.ackCommit(e.originClientSeq);
+
     const expected = this.cursor + 1n;
     if (e.roomSeq < expected) return; // already applied — an idempotent replay
     if (e.roomSeq > expected) {
@@ -193,8 +268,28 @@ export class Room {
     this.bump();
   }
 
+  private onNack(n: Nack): void {
+    if (n.roomId !== this.roomId) return;
+    const o = this.outstanding.get(n.clientSeq);
+    if (!o) return;
+    // UNAVAILABLE = no reachable owner / re-homing: transient. Keep it buffered so the recovery layer
+    // (S4) resends it once the room is LIVE again. Every other reason is terminal → reject.
+    if (n.reason === NackReason.UNAVAILABLE) return;
+    this.outstanding.delete(n.clientSeq);
+    o.reject(new NackError(n.reason));
+  }
+
+  private ackCommit(clientSeq: bigint): void {
+    const o = this.outstanding.get(clientSeq);
+    if (o) {
+      this.outstanding.delete(clientSeq);
+      o.resolve();
+    }
+  }
+
   private handleClose(reason?: Error): void {
-    // S4 turns this into a reconnect; for now a drop just fails anything awaiting.
+    // S4 turns this into a reconnect (keeping outstanding commits for resend); for now a drop just
+    // fails everything awaiting.
     this.rejectPending(reason ?? new Error('connection closed'));
   }
 
@@ -203,6 +298,8 @@ export class Room {
     this.joinWaiter = undefined;
     for (const w of this.pings.values()) w.reject(err);
     this.pings.clear();
+    for (const o of this.outstanding.values()) o.reject(err);
+    this.outstanding.clear();
   }
 
   private bump(): void {
