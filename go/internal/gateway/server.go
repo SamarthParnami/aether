@@ -11,6 +11,7 @@ package gateway
 import (
 	"context"
 	"log"
+	"math/rand/v2"
 	"net/http"
 	"sync"
 	"time"
@@ -26,9 +27,11 @@ import (
 const (
 	maxFrameBytes     = 1 << 20 // per-frame read cap (1 MiB)
 	writeTimeout      = 10 * time.Second
-	outQueue          = 64               // buffered outbound frames per connection
-	opsQueue          = 64               // buffered inbound room frames awaiting the ops worker
-	ephemeralOutLimit = outQueue * 3 / 4 // ephemerals may fill up to here; the top reserves room for events
+	outQueue          = 64                     // buffered outbound frames per connection
+	opsQueue          = 64                     // buffered inbound room frames awaiting the ops worker
+	ephemeralOutLimit = outQueue * 3 / 4       // ephemerals may fill up to here; the top reserves room for events
+	relayRetryBase    = 200 * time.Millisecond // first owner re-resolve delay during failover (re-homes are usually quick)
+	relayRetryCap     = 5 * time.Second        // backoff ceiling — bounds the sustained re-resolve rate per watcher
 	pingInterval      = 30 * time.Second
 	pingTimeout       = 10 * time.Second
 )
@@ -286,34 +289,106 @@ func (c *conn) handleJoin(ctx context.Context, join *aetherv1.Join) {
 	}
 	relayCtx, cancel := context.WithCancel(ctx)
 	c.rooms[room] = cancel
-	// Event + ephemeral relays are PAIRED under one ctx, started together at Join: a single
-	// Leave/re-Join/re-home cancels both as a unit. The ephemeral stream gives no independent
-	// re-home signal (it just goes silent), so only the event relay signals FROZEN; see
-	// roomruntime.TailEphemeral. Re-subscribing both on re-home lands with routing (G10).
-	c.wg.Add(2)
-	go func() { defer c.wg.Done(); c.relay(relayCtx, room, owner, fromSeq) }()
-	go func() { defer c.wg.Done(); c.ephemeralRelay(relayCtx, room, owner) }()
+	// One supervisor goroutine owns the room's live feed: it (re)subscribes the event stream and the
+	// PAIRED ephemeral stream, and on an owner-side failure re-resolves the owner and re-subscribes
+	// both from the cursor — signalling FROZEN→LIVE. A single Leave/re-Join cancels it.
+	c.wg.Add(1)
+	go func() { defer c.wg.Done(); c.relay(relayCtx, room, fromSeq) }()
 }
 
-// relay streams a room's events from its owner and forwards them to the client WS, until the relay
-// context is cancelled (client disconnect or Leave) or the owner stream ends. If the stream dies
-// for an owner-side reason (owner death — not the client leaving), it signals RoomStatus{FROZEN} so
-// the client knows its live feed dropped and can re-Join, rather than freezing silently. (Automatic
-// re-resolve + re-subscribe on owner failover lands with routing, G10; an owner *re-home* with the
-// owner still alive is already covered — the owner's Tail self-heals via its poll-ticker.)
-func (c *conn) relay(ctx context.Context, roomID string, owner aetherv1connect.RoomServiceClient, fromSeq uint64) {
+// relay supervises a room's live feed with auto-recovery, until ctx is cancelled (client Leave or
+// disconnect). Each iteration resolves the room's current owner and streams its events (and the
+// paired ephemeral feed); when an owner-side failure ends the stream — owner death, a re-home to a
+// node we can't yet see — it signals RoomStatus{FROZEN}, re-resolves the owner, and re-subscribes
+// from the cursor (the last room_seq delivered), emitting RoomStatus{LIVE} once delivery resumes.
+//
+// Recovery is gap-free because the cursor drives the re-subscribe and the owner replays from the
+// durable log; it works across an owner change because the room's events are the shared log, not
+// gateway- or owner-local state. (An owner re-home with the owner still alive needs no recovery here
+// — the owner's Tail self-heals via its poll-ticker; this loop covers the cases that actually break
+// the stream.) The ephemeral feed is re-subscribed as a unit with the event feed each attempt (it
+// has no independent re-home signal — see roomruntime.TailEphemeral).
+func (c *conn) relay(ctx context.Context, roomID string, fromSeq uint64) {
+	cursor := fromSeq
+	frozen := false
+	// Exponential backoff with jitter on the re-resolve loop. A presenter re-home freezes ALL their
+	// watchers at once; a fixed interval would make them hammer coord in lockstep (a DynamoDB read
+	// each, later) at the worst moment. Backoff + jitter spreads the herd. A successful subscribe
+	// resets it, so a quick owner-death→recovery still retries fast — only a SUSTAINED no-owner backs off.
+	backoff := relayRetryBase
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		owner, addr, err := c.srv.locator.Owner(roomID)
+		if err != nil {
+			// No reachable owner right now (lease lapsed / mid re-home) — freeze and retry.
+			c.freeze(ctx, roomID, &frozen)
+			if !waitRetry(ctx, backoff) {
+				return
+			}
+			backoff = nextBackoff(backoff)
+			continue
+		}
+
+		var subscribed bool
+		cursor, subscribed = c.streamRoom(ctx, roomID, owner, cursor, &frozen)
+		if ctx.Err() != nil {
+			return // clean shutdown — client left
+		}
+		// The stream ended for an owner-side reason: drop the stale owner so the next resolve re-dials.
+		c.srv.locator.Invalidate(addr)
+		c.freeze(ctx, roomID, &frozen)
+		if subscribed {
+			backoff = relayRetryBase // we did connect — a fresh death retries fast (re-homes are quick)
+		}
+		if !waitRetry(ctx, backoff) {
+			return
+		}
+		backoff = nextBackoff(backoff)
+	}
+}
+
+// streamRoom subscribes to one owner's event stream and the paired ephemeral stream, forwarding both
+// to the client until the event stream ends or ctx is cancelled. A successful (re)subscribe while
+// frozen emits RoomStatus{LIVE} and clears *frozen. It returns the highest room_seq delivered so the
+// supervisor can re-subscribe without a gap.
+//
+// The ephemeral relay is started FIRST, before owner.Subscribe: a Connect server-stream blocks the
+// Subscribe call until the owner's first send, which for a quiet room never comes — so spawning the
+// ephemeral relay after it would stall cursors/presence until the first commit. Starting it first
+// lets ephemerals flow immediately on join.
+// streamRoom returns the highest room_seq delivered AND whether it managed to subscribe (so the
+// supervisor resets its backoff after a real connection, but keeps backing off while no owner is
+// reachable).
+func (c *conn) streamRoom(
+	ctx context.Context, roomID string, owner aetherv1connect.RoomServiceClient, cursor uint64, frozen *bool,
+) (uint64, bool) {
+	// Pair the ephemeral relay to this attempt: re-subscribed with the event stream, torn down with it.
+	attemptCtx, attemptCancel := context.WithCancel(ctx)
+	defer attemptCancel()
+	c.wg.Add(1)
+	go func() { defer c.wg.Done(); c.ephemeralRelay(attemptCtx, roomID, owner) }()
+
 	stream, err := owner.Subscribe(ctx, connect.NewRequest(&aetherv1.SubscribeRequest{
-		RoomId: roomID, FromSeq: fromSeq,
+		RoomId: roomID, FromSeq: cursor,
 	}))
 	if err != nil {
-		c.signalRoomFrozen(ctx, roomID)
-		return
+		return cursor, false
 	}
 	defer func() { _ = stream.Close() }()
-	for stream.Receive() {
-		c.send(&aetherv1.ServerMessage{Body: &aetherv1.ServerMessage_Event{Event: stream.Msg().GetEvent()}})
+
+	if *frozen {
+		c.signalRoomStatus(ctx, roomID, aetherv1.RoomStatus_STATUS_LIVE)
+		*frozen = false
 	}
-	c.signalRoomFrozen(ctx, roomID)
+
+	for stream.Receive() {
+		ev := stream.Msg().GetEvent()
+		c.send(&aetherv1.ServerMessage{Body: &aetherv1.ServerMessage_Event{Event: ev}})
+		cursor = ev.GetRoomSeq()
+	}
+	return cursor, true
 }
 
 // ephemeralRelay streams a room's live ephemerals from its owner to the client WS until the relay
@@ -335,17 +410,53 @@ func (c *conn) ephemeralRelay(ctx context.Context, roomID string, owner aetherv1
 	}
 }
 
-// signalRoomFrozen tells the client a room's live feed dropped — but only when the relay died for
-// an owner-side reason. A cancelled relay context means the client left or disconnected (a clean
-// end), so nothing is sent.
-func (c *conn) signalRoomFrozen(ctx context.Context, roomID string) {
+// signalRoomStatus reports a room's live-feed status (LIVE | FROZEN) to the client, unless the relay
+// ctx is already cancelled — a clean client Leave/disconnect, which needs no signal.
+func (c *conn) signalRoomStatus(ctx context.Context, roomID string, status aetherv1.RoomStatus_Status) {
 	if ctx.Err() != nil {
 		return
 	}
 	c.send(&aetherv1.ServerMessage{Body: &aetherv1.ServerMessage_RoomStatus{RoomStatus: &aetherv1.RoomStatus{
 		RoomId: roomID,
-		Status: aetherv1.RoomStatus_STATUS_FROZEN,
+		Status: status,
 	}}})
+}
+
+// freeze emits RoomStatus{FROZEN} once on the live→frozen transition (idempotent while frozen, so a
+// flapping owner doesn't spam the client).
+func (c *conn) freeze(ctx context.Context, roomID string, frozen *bool) {
+	if *frozen {
+		return
+	}
+	c.signalRoomStatus(ctx, roomID, aetherv1.RoomStatus_STATUS_FROZEN)
+	*frozen = true
+}
+
+// waitRetry sleeps one retry interval, returning false if ctx is cancelled meanwhile (so the relay
+// stops promptly on disconnect instead of waiting out the backoff).
+func waitRetry(ctx context.Context, d time.Duration) bool {
+	// Half jitter: sleep within [d/2, d] so a freed herd of watchers doesn't re-resolve in lockstep.
+	jittered := d/2 + time.Duration(rand.Int64N(int64(d/2)+1))
+	t := time.NewTimer(jittered)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// nextBackoff doubles d up to the cap — the growth of the re-resolve interval under a sustained
+// no-owner condition.
+func nextBackoff(d time.Duration) time.Duration {
+	if d >= relayRetryCap {
+		return relayRetryCap
+	}
+	if next := d * 2; next < relayRetryCap {
+		return next
+	}
+	return relayRetryCap
 }
 
 // handleLeave stops the live relay for a room — the client no longer wants its events.
@@ -366,9 +477,13 @@ func (c *conn) handleCommit(ctx context.Context, commit *aetherv1.Commit) {
 		return
 	}
 
+	// On no-owner / transport failure, Nack the SPECIFIC commit (by client_seq) with a transient
+	// UNAVAILABLE reason — not an uncorrelated Error — so the SDK can tell a re-home blip apart from a
+	// permanent rejection and buffer + resubmit this commit when the room's relay signals LIVE again.
+	// The write-side mirror of the relay's read-side FROZEN/LIVE recovery.
 	owner, addr, err := c.srv.locator.Owner(room)
 	if err != nil {
-		c.send(errorFrame("UNAVAILABLE", "room has no reachable owner"))
+		c.send(nackFrame(room, commit.GetClientSeq(), aetherv1.NackReason_NACK_REASON_UNAVAILABLE))
 		return
 	}
 
@@ -379,10 +494,8 @@ func (c *conn) handleCommit(ctx context.Context, commit *aetherv1.Commit) {
 		Body:      commit.GetBody(),
 	}))
 	if err != nil {
-		// Not (or no longer) the owner, or a transport failure: drop the dead client and signal
-		// unavailable. Re-resolve + retry (and FROZEN) land with routing (G10).
-		c.srv.locator.Invalidate(addr)
-		c.send(errorFrame("UNAVAILABLE", "commit could not be routed to the owner"))
+		c.srv.locator.Invalidate(addr) // stale/dead owner — re-resolve on the next attempt
+		c.send(nackFrame(room, commit.GetClientSeq(), aetherv1.NackReason_NACK_REASON_UNAVAILABLE))
 		return
 	}
 	if nack := resp.Msg.GetNack(); nack != nil {
