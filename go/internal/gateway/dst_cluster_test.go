@@ -100,6 +100,12 @@ func (c *dstCluster) stopAll() {
 	}
 }
 
+// killOwner stops owner i's server + listener, so its open streams break and new dials to it fail —
+// the connection-level "owner death" fault, injected at the byte-stream seam (per the #40 review,
+// per-message drop/dup/reorder have no analogue on a single ordered stream and belong on a Connect
+// interceptor instead). Idempotent, so it composes with stopAll.
+func (c *dstCluster) killOwner(i int) { c.stops[i]() }
+
 // dial connects a client to gateway g over a frame pipe, runs the conn, and returns the client end
 // plus a stop func that tears it down and waits for the conn's goroutines to exit.
 func (c *dstCluster) dial(ctx context.Context, g *Server, principalID string) (*framePipe, func()) {
