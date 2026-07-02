@@ -51,8 +51,23 @@ var (
 type Server struct {
 	auth    Authenticator
 	locator *OwnerLocator
-	secret  []byte // HMAC key for client_id derivation (cluster-wide)
+	secret  []byte     // HMAC key for client_id derivation (cluster-wide)
+	rng     jitterRand // source for the relay backoff jitter; injectable so DST can seed it
 }
+
+// jitterRand is the randomness the relay backoff jitter draws from. Production uses the global
+// math/rand/v2 pool (concurrent-safe); the DST harness injects a seeded, locked source so a chaos
+// seed reproduces the relay's retry cadence (synctest fakes the clock but not rand — see
+// 06-design-dst.md). Only Int64N is needed.
+type jitterRand interface {
+	Int64N(n int64) int64
+}
+
+// globalRand is the production jitterRand: the top-level math/rand/v2 functions, which are
+// concurrent-safe (unlike a bare *rand.Rand shared across per-connection relays).
+type globalRand struct{}
+
+func (globalRand) Int64N(n int64) int64 { return rand.Int64N(n) }
 
 // ServerOption configures a Server.
 type ServerOption func(*Server)
@@ -62,12 +77,19 @@ type ServerOption func(*Server)
 // gateway. Defaults to a dev-only key.
 func WithClientIDSecret(secret []byte) ServerOption { return func(s *Server) { s.secret = secret } }
 
+// WithRand injects the source for the relay backoff jitter. Defaults to the global math/rand/v2
+// pool; DST passes a seeded source so relay retry timing is reproducible under a chaos seed.
+func WithRand(r jitterRand) ServerOption { return func(s *Server) { s.rng = r } }
+
 // NewServer returns a gateway WebSocket server: it authenticates handshakes with auth and routes
 // room traffic to owners via locator.
 func NewServer(auth Authenticator, locator *OwnerLocator, opts ...ServerOption) *Server {
 	s := &Server{auth: auth, locator: locator}
 	for _, opt := range opts {
 		opt(s)
+	}
+	if s.rng == nil {
+		s.rng = globalRand{}
 	}
 	if s.secret == nil {
 		// Fail loud, not silent: a prod gateway that forgot WithClientIDSecret would otherwise
@@ -329,7 +351,7 @@ func (c *conn) relay(ctx context.Context, roomID string, fromSeq uint64) {
 		if err != nil {
 			// No reachable owner right now (lease lapsed / mid re-home) — freeze and retry.
 			c.freeze(ctx, roomID, &frozen)
-			if !waitRetry(ctx, backoff) {
+			if !c.waitRetry(ctx, backoff) {
 				return
 			}
 			backoff = nextBackoff(backoff)
@@ -347,7 +369,7 @@ func (c *conn) relay(ctx context.Context, roomID string, fromSeq uint64) {
 		if subscribed {
 			backoff = relayRetryBase // we did connect — a fresh death retries fast (re-homes are quick)
 		}
-		if !waitRetry(ctx, backoff) {
+		if !c.waitRetry(ctx, backoff) {
 			return
 		}
 		backoff = nextBackoff(backoff)
@@ -439,9 +461,9 @@ func (c *conn) freeze(ctx context.Context, roomID string, frozen *bool) {
 
 // waitRetry sleeps one retry interval, returning false if ctx is cancelled meanwhile (so the relay
 // stops promptly on disconnect instead of waiting out the backoff).
-func waitRetry(ctx context.Context, d time.Duration) bool {
+func (c *conn) waitRetry(ctx context.Context, d time.Duration) bool {
 	// Half jitter: sleep within [d/2, d] so a freed herd of watchers doesn't re-resolve in lockstep.
-	jittered := d/2 + time.Duration(rand.Int64N(int64(d/2)+1))
+	jittered := d/2 + time.Duration(c.srv.rng.Int64N(int64(d/2)+1))
 	t := time.NewTimer(jittered)
 	defer t.Stop()
 	select {
