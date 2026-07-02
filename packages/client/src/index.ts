@@ -8,4 +8,5 @@
  */
 export * from './codec.js';
 export * from './room.js';
+export * from './store.js';
 export * from './transport.js';
