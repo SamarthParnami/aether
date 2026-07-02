@@ -76,7 +76,10 @@ type dstCluster struct {
 	stops  []func()
 }
 
-func newDSTCluster(owners, gateways int) (*dstCluster, []*Server) {
+// newDSTCluster wires owners + gateways; seed drives each gateway's backoff-jitter rng (XORed with
+// the gateway index, so gateways still differ) — so a chaos sweep over seeds explores DISTINCT relay
+// retry timings, not the same timing path repeated.
+func newDSTCluster(seed uint64, owners, gateways int) (*dstCluster, []*Server) {
 	c := &dstCluster{co: coord.NewMemory(), log: logstore.NewMemory(), net: newDSTNet()}
 	for i := 0; i < owners; i++ {
 		addr := fmt.Sprintf("owner-%d", i)
@@ -89,7 +92,7 @@ func newDSTCluster(owners, gateways int) (*dstCluster, []*Server) {
 	for i := range gws {
 		gws[i] = NewServer(DevAuthenticator{Header: "X-Aether-Principal"},
 			NewOwnerLocator(c.co, WithLocatorHTTPClient(c.net.httpClient())),
-			WithRand(newLockedRand(uint64(i+1))))
+			WithRand(newLockedRand(seed^uint64(i)+1)))
 	}
 	return c, gws
 }
@@ -132,7 +135,7 @@ func joinRoom(ctx context.Context, t *testing.T, c frameConn, room, nonce string
 // chaos suite (G11d) will stress. synctest.Wait confirms the whole cluster parks.
 func TestSynctestClusterMultiGatewayConverges(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		cl, gws := newDSTCluster(2, 2) // 2 owners, 2 gateways
+		cl, gws := newDSTCluster(1, 2, 2) // seed 1, 2 owners, 2 gateways
 		defer cl.stopAll()
 		bg := context.Background()
 

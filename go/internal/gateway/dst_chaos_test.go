@@ -89,7 +89,7 @@ func TestDST_ChaosFailoverConvergence(t *testing.T) {
 func runChaosSeed(t *testing.T, seed uint64) {
 	synctest.Test(t, func(t *testing.T) {
 		rng := mathrand.New(mathrand.NewPCG(seed, seed))
-		cl, gws := newDSTCluster(3, 2) // 3 owners (2 survivors), 2 gateways
+		cl, gws := newDSTCluster(seed, 3, 2) // seed drives per-gw retry jitter; 3 owners, 2 gateways
 		defer cl.stopAll()
 		bg := context.Background()
 		ctx, cancel := context.WithCancel(bg)
@@ -117,13 +117,17 @@ func runChaosSeed(t *testing.T, seed uint64) {
 			ws[i] = newWatcher(ctx, pipe)
 		}
 
-		// Phase 1: a seeded burst of commits to owner-0, delivered to every watcher.
+		// Phase 1: a seeded burst of commits to owner-0. We deliberately do NOT wait for delivery —
+		// so the kill below can land MID-delivery, and it's the relay's cursor-resume (replaying the
+		// events it missed off the shared log after re-home) that must preserve no-loss. Combined with
+		// the seed-driven retry jitter, each seed explores a distinct failover interleaving, not the
+		// same clean quiescent boundary.
 		for n := 1 + int(rng.Int64N(4)); n > 0; n-- {
 			commit(0)
 		}
-		synctest.Wait()
 
-		// FAULT: kill owner-0; its lease lapses on the fake clock; a survivor takes over.
+		// FAULT: kill owner-0 (possibly with phase-1 still in flight); its lease lapses on the fake
+		// clock; a survivor takes over.
 		cl.killOwner(0)
 		time.Sleep(11 * time.Second) // past roomruntime's 10s lease TTL → owner-0's lease expires
 
