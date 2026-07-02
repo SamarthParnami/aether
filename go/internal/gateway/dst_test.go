@@ -2,16 +2,36 @@ package gateway
 
 import (
 	"context"
+	mathrand "math/rand/v2"
 	"net"
 	"sync"
 	"testing"
 	"testing/synctest"
+	"time"
 
 	"google.golang.org/protobuf/proto"
 
 	aetherv1 "github.com/SamarthParnami/aether/go/gen/aether/v1"
 	"github.com/SamarthParnami/aether/go/internal/coord"
 )
+
+// lockedRand is the DST jitterRand: a seeded source guarded by a mutex, so the per-conn relays that
+// share a Server's rng draw reproducibly AND race-free. (A bare *rand.Rand shared across goroutines
+// is not concurrency-safe — the reason globalRand wraps the top-level pool for production instead.)
+type lockedRand struct {
+	mu sync.Mutex
+	r  *mathrand.Rand
+}
+
+func newLockedRand(seed uint64) *lockedRand {
+	return &lockedRand{r: mathrand.New(mathrand.NewPCG(seed, seed))}
+}
+
+func (l *lockedRand) Int64N(n int64) int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.r.Int64N(n)
+}
 
 // framePipe is an in-memory frameConn pair (like net.Pipe, but frame-oriented): a WriteFrame on one
 // end is a ReadFrame on the other. Every operation is a channel send/recv or a select — all
@@ -137,4 +157,47 @@ func TestSynctestConnReachesQuiescenceAndTearsDown(t *testing.T) {
 		cancel() // read loop's ReadFrame returns ctx.Err → run() drains every goroutine
 		<-done   // run() returned: clean teardown, no leaked/deadlocked goroutine
 	})
+}
+
+// The WithRand seam (from #39 review, which noted it was plumbed but unexercised): the relay backoff
+// jitter draws from the INJECTED source, a seeded source is REPRODUCIBLE run-to-run, and a locked
+// source is -RACE-CLEAN under the concurrent per-conn draws the seam exists for.
+func TestWithRandSeam(t *testing.T) {
+	// Reproducibility: c.waitRetry draws its jitter from c.srv.rng. Under synctest the backoff sleep
+	// is instant and the fake clock advances by exactly the jittered duration — so we read the drawn
+	// jitter straight off the clock, and the same seed must draw the same jitter.
+	draw := func(seed uint64) time.Duration {
+		var jitter time.Duration
+		synctest.Test(t, func(t *testing.T) {
+			srv := NewServer(DevAuthenticator{Header: "X"}, NewOwnerLocator(coord.NewMemory()), WithRand(newLockedRand(seed)))
+			c := &conn{srv: srv}
+			start := time.Now()
+			if !c.waitRetry(context.Background(), time.Second) {
+				t.Fatal("waitRetry returned false (cancelled) unexpectedly")
+			}
+			jitter = time.Since(start)
+		})
+		return jitter
+	}
+	if a, b := draw(42), draw(42); a != b {
+		t.Fatalf("seeded jitter not reproducible: %v vs %v", a, b)
+	}
+	if j := draw(42); j < 500*time.Millisecond || j > time.Second { // half jitter of d=1s ∈ [d/2, d]
+		t.Fatalf("jitter %v outside [500ms, 1s] — the draw did not happen as expected", j)
+	}
+
+	// Race-cleanliness: many concurrent draws on one locked source (per-conn relays sharing a Server's
+	// rng) must be -race-clean; a bare *rand.Rand here would trip the detector.
+	shared := newLockedRand(1)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				_ = shared.Int64N(1000)
+			}
+		}()
+	}
+	wg.Wait()
 }
