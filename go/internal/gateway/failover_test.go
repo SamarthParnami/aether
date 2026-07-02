@@ -48,15 +48,25 @@ func TestRelayRecoversAfterFailover(t *testing.T) {
 		t.Fatalf("joined = %v, want current_seq 1", joined)
 	}
 
+	// Warm up the relay: deliver one live event so its Tail has definitely subscribed (and thus
+	// acquired A's lease) BEFORE the handoff. Otherwise Release could race the relay's claim-on-serve
+	// Tail re-acquiring A's lease afterwards, leaving A the owner so B can't take over.
+	if _, applied, err := a.Commit(bg, "room", "x", 2, kvBody("k", "2")); err != nil || !applied {
+		t.Fatalf("A warm-up commit: applied=%v err=%v", applied, err)
+	}
+	if ev := readFrame(ctx, t, ws).GetEvent(); ev == nil || ev.GetRoomSeq() != 2 {
+		t.Fatalf("relay warm-up event = %v, want room_seq 2", ev)
+	}
+
 	// Failover: A hands off and dies; B takes over with a post-failover commit (same shared log).
 	a.Release("room")
 	stopA()
-	if _, applied, err := b.Commit(bg, "room", "x", 2, kvBody("k", "2")); err != nil || !applied {
+	if _, applied, err := b.Commit(bg, "room", "x", 3, kvBody("k", "3")); err != nil || !applied {
 		t.Fatalf("B failover commit: applied=%v err=%v", applied, err)
 	}
 
 	// The relay recovers on its own: FROZEN (feed dropped) → LIVE (re-subscribed to B) → the
-	// post-failover event (room_seq 2), gap-free.
+	// post-failover event (room_seq 3), gap-free.
 	sawFrozen, sawLive := false, false
 	for {
 		m := readFrame(ctx, t, ws)
@@ -69,7 +79,7 @@ func TestRelayRecoversAfterFailover(t *testing.T) {
 			}
 			continue
 		}
-		if ev := m.GetEvent(); ev != nil && ev.GetRoomSeq() == 2 {
+		if ev := m.GetEvent(); ev != nil && ev.GetRoomSeq() == 3 {
 			if !sawFrozen {
 				t.Fatal("recovered without ever signalling FROZEN")
 			}
