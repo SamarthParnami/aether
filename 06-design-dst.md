@@ -40,33 +40,58 @@ This is the fork G11 must resolve.
 
 ## 3. Approaches considered
 
+> This section's decision was validated by a dedicated research pass (Go `testing/synctest`, gosim,
+> Dropbox Nucleus/Trinity, Antithesis, Polar Signals). Sources are cited inline; see §3.1.
+
 **A. Rewrite the gateway as an event-driven sim node.** Re-express the connection as a state
-machine with no goroutines/timers — every action (frame in, RPC reply, timer fire) is a `sim` event
-handled synchronously — so the whole path runs single-threaded and replays bit-for-bit.
-- ✅ True bit-for-bit determinism across the *entire* path.
+machine with no goroutines/timers — every action a `sim` event handled synchronously — so the whole
+path runs single-threaded and replays bit-for-bit.
+- ✅ True bit-for-bit determinism across the *entire* path (Dropbox took this path — Nucleus runs
+  nearly all code on one control thread; Trinity re-runs a seed to the identical final state).
 - ❌ Throws away the merged, tested, goroutine-based gateway (G1–G10) and maintains a *second*
-  implementation — or ships the sim version to prod, abandoning the natural concurrent design. A
-  large step backward on working code, and a permanent two-implementations tax.
+  implementation. Bit-for-bit interleaving replay in Go **only** comes from this kind of heavyweight
+  route — a single-threaded rewrite (Dropbox), source-translating the runtime (gosim), or an external
+  hypervisor (Antithesis). Worth it *only if reproducible replay-debugging is itself a hard
+  requirement* — which a "invariants over thousands of seeds" suite is not.
 
-**B. Integration DST — real gateway + owner over in-memory, sim-faulted transports.** Keep the real
-concurrent gateway and owner. Replace only the *transports* with in-memory implementations the sim
-controls, drive **seeded** client workloads and **seeded** chaos, and assert the invariants at
-quiescence, over thousands of seeds.
-- ✅ Exercises the *actual* production code (races, teardown, recovery, backoff) under chaos.
-- ✅ Reuses `sim.Network`'s fault model (drop/dup/delay/reorder/partition) and seeded RNG for the
-  workload + fault schedule — so a failing seed re-runs the *same* workload and *same* fault
-  schedule (run it under `-race` to debug).
-- ⚠️ **Not byte-for-byte replayable**: real goroutine scheduling can interleave differently between
-  runs of the same seed. The *inputs* (workload, faults) are seeded and reproducible; the internal
-  interleaving is not. The invariants are checked on **every** seed regardless.
+**B (plain). Integration DST over in-memory transports, real goroutines, real time.** Keep the real
+gateway/owner; swap only transports; drive seeded workloads + chaos; assert invariants at quiescence.
+- ✅ Runs the *actual* production code under chaos; minimal change.
+- ⚠️ Real wall-clock timers make the suite slow (real backoff sleeps) and quiescence hard to detect;
+  not byte-for-byte replayable. Still effective — Polar Signals' only-"mostly"-deterministic seeded
+  DST found 3 data-loss + 2 data-duplication bugs in weeks — but leaves determinism on the table.
 
-**Decision: B, layered on the owner's existing bit-for-bit DST (a hybrid).** The Phase-1 exit
-criterion is about the **invariants holding under chaos over thousands of seeds**, not about the
-gateway's goroutine interleaving being reproducible. Bit-for-bit is a *means* (cheap debugging), and
-we keep it where it's achievable — the owner core (`roomcore` pure, `roomruntime` single-threaded).
-Rewriting the concurrent gateway solely to make its scheduling replayable is not worth abandoning
-the real design. Integration DST checks the same invariants on every seed and runs the real code;
-the reproducibility gap is bounded to internal interleaving and mitigated by seeded inputs + `-race`.
+**C. synctest-hybrid — B, but run the real goroutines inside a `testing/synctest` bubble. ← CHOSEN.**
+`testing/synctest` (Go 1.24 experimental, **stable in 1.25**; we build on 1.26) runs **real,
+unmodified** goroutines in an isolated bubble with a **fake clock that advances only when every
+goroutine is durably blocked**, and `synctest.Wait` blocks until the bubble is idle — a deterministic
+**quiescence point**. So timers/backoff/keepalive fire **instantly and deterministically**, and the
+harness gets a clean "system is quiet, now assert" signal — all with **no changes to the gateway**.
+- ✅ Deterministic **time** + quiescence on the real concurrent code, no rewrite. Timer-heavy paths
+  (relay backoff, ping) run instantly, so thousands of seeds are cheap.
+- ✅ Reuses B's transport swap: synctest **requires** it anyway — real socket / Connect-RPC I/O is
+  *not durably blocking*, so a goroutine parked on a real conn never lets the bubble go idle. The Go
+  docs prescribe `net.Pipe`-style in-memory conns for exactly this.
+- ⚠️ synctest gives deterministic *time*, **not** deterministic goroutine *interleaving* — it is a
+  clock + idle detector, not a replay engine, and is designed to run **with `-race`**. So the suite
+  is reproducible in its *inputs* (seeded workload + faults) but not byte-for-byte in scheduling.
+  That is precisely what a Phase-1 invariants suite needs, and no more.
+
+**Decision: C (synctest-hybrid), layered on the owner's existing bit-for-bit DST.** The Phase-1 exit
+criterion is *invariants holding under chaos over thousands of seeds*, not reproducible gateway
+scheduling. synctest gives the achievable determinism (time + quiescence) on the **real** code for
+free on top of the transport swap we needed regardless; option A's rewrite buys byte-for-byte replay
+we don't require, at a cost we don't want. We keep bit-for-bit where it already exists and is cheap —
+the owner core (`roomcore` pure, `roomruntime` single-threaded, its own `sim`-driven DST).
+
+### 3.1 Sources
+- Go `testing/synctest`: fake clock, durable-block idle detection, `synctest.Wait`, "requires a fake
+  network implementation (e.g. `net.Pipe`)" — [go.dev/blog/synctest](https://go.dev/blog/synctest),
+  [pkg.go.dev/testing/synctest](https://pkg.go.dev/testing/synctest).
+- Bit-for-bit interleaving replay needs heavyweight routes: gosim (source-translates the runtime),
+  Dropbox Nucleus/Trinity (single-threaded rewrite), Antithesis (deterministic hypervisor).
+- Imperfect ("mostly") deterministic seeded-fault DST still catches serious bugs — Polar Signals
+  (3 data-loss + 2 data-dup bugs in weeks); "an 80% solution suffices."
 
 ## 4. The seams we need
 
@@ -76,17 +101,18 @@ Most of the injection surface already exists; G11 fills the gaps.
 |------|-------|-----------|
 | **gateway → owner RPC** | `OwnerLocator.Owner()` returns the `RoomServiceClient` *interface*; `WithLocatorHTTPClient(connect.HTTPClient)` injects the transport | An **in-memory `connect.HTTPClient`** (or a direct in-memory `RoomServiceClient`) that routes calls to in-process owners through `sim.Network`, so RPCs can be dropped / delayed / partitioned and owners killed. |
 | **client → gateway WS** | `conn` reads/writes a concrete `*coder/websocket.Conn` | Abstract the read/write behind a tiny **frame transport interface** (`ReadFrame`/`WriteFrame`) with a real WS impl (prod) and an in-memory impl (DST) the sim can fault. |
-| **gateway clock** | ping ticker + relay backoff use real `time` | A **clock seam** (`Now` + `NewTimer`/ticker) — real in prod, sim-driven in DST — so keepalive/backoff advance on the sim clock. *(Owner already has `WithClock`.)* |
-| **gateway RNG** | relay jitter uses global `math/rand/v2` | An injectable **rng** (`WithRand`), defaulting to a real source, so the fault/backoff randomness is seeded in DST. *(Flagged in #36 review.)* |
-| **owner clock** | `roomruntime.WithClock` | Reuse as-is. |
+| **gateway clock** | ping ticker + relay backoff use the standard `time` package | **Nothing** — `testing/synctest` replaces the `time` package's clock *inside the bubble automatically*. `time.NewTimer`/`Ticker`/`Now`/`Sleep` become fake-clock-driven with no code change. (No `WithClock` injection needed, unlike the owner.) |
+| **gateway RNG** | relay jitter uses global `math/rand/v2` | Minor: an optional injectable rng (`WithRand`) so jitter is seeded. Not load-bearing — synctest makes the jittered sleep instant anyway; do it only to silence the #36 non-determinism note. |
+| **owner clock** | `roomruntime.WithClock` | Pass `time.Now`; the bubble's fake clock drives lease expiry too. |
 
-The client → gateway seam is the only real refactor; the rest are additive options mirroring the
-owner's existing pattern.
+The two **transport seams are the real work** (and the enabler — synctest *requires* them). The clock
+"seam" evaporates: synctest gives it for free. The RNG is a nice-to-have.
 
 ## 5. Fault matrix
 
-Driven by `sim.Network` (`FaultConfig{DropProb, DupProb, MinDelay, MaxDelay}` + `Partition`/`Heal`)
-plus lifecycle events scheduled on the sim:
+Injected at the in-memory transport wrappers (the fault model mirrors `sim.Network`'s
+`DropProb`/`DupProb`/`MinDelay`/`MaxDelay` + `Partition`/`Heal`), seeded by the per-seed `*rand.Rand`;
+lifecycle events (kills, reconnects) scheduled on the bubble's fake clock via `time.AfterFunc`:
 
 - **Message faults** on both transports: drop, duplicate, delay, reorder.
 - **Partitions**: client|gateway, gateway|owner, owner|owner (coord), healed after a while.
@@ -109,18 +135,36 @@ dedup-hits, reconnects each `> 0` across the sweep, so a suite that accidentally
 
 ## 7. PR decomposition (small, independently-mergeable)
 
-- **G11a — gateway clock + RNG seam.** `WithClock` / `WithRand` on the gateway `Server` (mirror the owner); relay backoff/jitter + ping use them; default to real time/rand. No prod behaviour change. Removes the global `math/rand/v2` (#36 review). *(Small, foundational.)*
-- **G11b — client↔gateway frame transport seam.** Extract `ReadFrame`/`WriteFrame` behind an interface; real WS impl + an in-memory impl. Existing gateway tests re-pointed at the seam (no behaviour change). *(Interface-before-callers.)*
-- **G11c — in-memory sim transports.** An in-process `RoomServiceClient` (gateway→owner) and the in-memory client transport, both routed through `sim.Network` with faults; a `dstCluster` harness wiring N gateways + M owners + K clients + coord + logs on one sim.
-- **G11d — the chaos suite.** Seeded workload (presenters commit, watchers read, some broadcast) + the fault schedule from §5; the §6 invariant assertions; sweep seeds 1..N with the §6 teeth. This is the Phase-1 exit gate.
+- **G11a — synctest smoke + transport seams (client↔gateway).** Extract the connection's frame
+  read/write behind a tiny interface (real `coder/websocket` impl unchanged for prod; a `net.Pipe`-
+  style in-memory impl for tests). Prove the payoff up front: a `synctest.Test` that runs **one real
+  gateway conn + one real owner over in-memory transports** through a Join/Commit/relay round-trip,
+  reaching `synctest.Wait` quiescence with no deadlock. **This de-risks the whole approach** (the §8
+  open question: do the ~5 per-conn goroutines actually go durably-blocked under synctest?). Ship the
+  optional `WithRand` here too if convenient.
+- **G11b — in-memory faulted transports + `dstCluster` harness.** A fault-injecting wrapper over the
+  in-memory transports (drop/dup/delay/reorder/partition), seeded by a per-seed `*rand.Rand`; an
+  in-process `RoomServiceClient` (gateway→owner) over the same; a `dstCluster` that wires N gateways +
+  M owners + K client drivers + shared coord/logs, all inside one synctest bubble. No chaos yet — just
+  the wiring + a clean multi-node happy path under `synctest.Wait`.
+- **G11c — the chaos suite (Phase-1 exit gate).** Seeded workload (presenters commit, watchers read,
+  some broadcast) + the §5 fault schedule (incl. kill owner/gateway, partition, lease expiry); advance
+  the fake clock; at `synctest.Wait` quiescence, drain and assert the §6 invariants; sweep seeds 1..N
+  with the §6 teeth (assert takeovers/conflicts/dedup-hits/reconnects each `> 0`). Runs with `-race`.
 
-Each PR ships its own tests; G11d is the milestone.
+The single-threaded `sim` kernel stays the owner core's DST driver; the full-path suite uses synctest
+(the two are complementary — owner bugs still reproduce bit-for-bit in the owner DST). Each PR ships
+its own tests; G11c is the milestone.
 
 ## 8. Reproducibility & debugging a failing seed
 
-The workload and fault schedule are a pure function of the seed, so a failing seed **re-runs the
-same scenario**. Because goroutine interleaving isn't pinned, reproduction is *statistical*, not
-guaranteed on the first replay — so the debug loop is: re-run the seed under `-race` and with a tight
-`-count` until it trips, with verbose per-event logging keyed by sim time. Where a bug is actually in
-the owner core (dedup, ordering, conflict handling), it also reproduces bit-for-bit in the existing
-owner DST, which stays the first line of defence.
+The workload and fault schedule are a pure function of the seed, so a failing seed **re-runs the same
+scenario**, and synctest pins **time** (the fake clock is a deterministic function of the durably-
+blocked sequence). What synctest does **not** pin is goroutine *interleaving* — so reproduction of a
+race-driven failure is *statistical*, not guaranteed on the first replay. The debug loop: re-run the
+seed under `-race` (which synctest is designed to be used with) at a tight `-count` until it trips,
+with per-event logging keyed by the fake clock. Where a bug is in the owner core (dedup, ordering,
+conflict handling) it also reproduces **bit-for-bit** in the existing `sim`-driven owner DST, which
+stays the first line of defence. A hard requirement for byte-for-byte replay-debugging would push
+toward option A (Dropbox/Trinity-style); this suite's goal — invariants under chaos over thousands of
+seeds — does not need it.
