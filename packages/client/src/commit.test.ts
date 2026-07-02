@@ -91,12 +91,13 @@ describe('Room commit path', () => {
 
   it('assigns a monotonic client_seq per commit', async () => {
     const { room, server } = await joinedRoom();
-    void room.commit(kvBody('a', '1'));
-    void room.commit(kvBody('b', '2'));
+    void room.commit(kvBody('a', '1')).catch(() => {});
+    void room.commit(kvBody('b', '2')).catch(() => {});
 
     const seqOf = (m: ClientMessage) => (m.body.case === 'commit' ? m.body.value.clientSeq : -1n);
     expect(seqOf(await recvClient(server))).toBe(1n);
     expect(seqOf(await recvClient(server))).toBe(2n);
+    room.close(); // drain the (un-acked) commits' retry timer
   });
 
   it('rejects a commit the server Nacks with a NackError carrying the reason', async () => {
