@@ -10,6 +10,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"log"
 	"math/rand/v2"
 	"net/http"
@@ -91,14 +92,20 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return // Accept already wrote the failure response
 	}
-	(&conn{
+	newConn(s, principal, newWSFrameConn(ws)).run(r.Context())
+}
+
+// newConn builds a connection over a frame transport. Production passes a wsFrameConn (from
+// ServeHTTP); the DST harness passes an in-memory pipe.
+func newConn(s *Server, principal Principal, ft frameConn) *conn {
+	return &conn{
 		srv:       s,
 		principal: principal,
-		ws:        ws,
+		ft:        ft,
 		out:       make(chan *aetherv1.ServerMessage, outQueue),
 		ops:       make(chan *aetherv1.ClientMessage, opsQueue),
 		rooms:     map[string]context.CancelFunc{},
-	}).run(r.Context())
+	}
 }
 
 // conn is one client WebSocket: a read loop decoding ClientMessage frames, an ops worker that
@@ -115,7 +122,7 @@ type conn struct {
 	srv       *Server
 	principal Principal
 	clientID  string // derived at Join (HMAC of principal+nonce); the dedup identity for commits
-	ws        *websocket.Conn
+	ft        frameConn
 	out       chan *aetherv1.ServerMessage
 	ops       chan *aetherv1.ClientMessage // decoded room frames awaiting the worker (Ping excluded)
 	cancel    context.CancelFunc
@@ -129,8 +136,6 @@ func (c *conn) run(ctx context.Context) {
 	c.cancel = cancel
 	defer cancel()
 
-	c.ws.SetReadLimit(maxFrameBytes)
-
 	// The background loops cancel the shared context on exit: a wedged writer or a missed pong then
 	// unblocks the read loop (and any send) rather than deadlocking it. The ops worker only exits on
 	// cancellation, so its cancel is a no-op — included for symmetry.
@@ -142,19 +147,19 @@ func (c *conn) run(ctx context.Context) {
 	c.readLoop(ctx) // blocks until the client disconnects, errors, or the context is cancelled
 	cancel()        // stop the loops and every per-room relay (their ctxs descend from this one)
 	c.wg.Wait()     // writeLoop + pingLoop + relays all drained before we close the socket
-	_ = c.ws.Close(websocket.StatusNormalClosure, "")
+	_ = c.ft.Close()
 }
 
 // readLoop decodes inbound frames until the connection closes or the context is cancelled.
 func (c *conn) readLoop(ctx context.Context) {
 	for {
-		typ, data, err := c.ws.Read(ctx)
+		data, err := c.ft.ReadFrame(ctx)
 		if err != nil {
+			if errors.Is(err, errNonBinaryFrame) {
+				c.send(errorFrame("INVALID", "expected a binary protobuf frame"))
+				continue
+			}
 			return // normal close, transport error, or ctx cancelled — tear down
-		}
-		if typ != websocket.MessageBinary {
-			c.send(errorFrame("INVALID", "expected a binary protobuf frame"))
-			continue
 		}
 		var m aetherv1.ClientMessage
 		if err := proto.Unmarshal(data, &m); err != nil {
@@ -541,7 +546,7 @@ func (c *conn) writeLoop(ctx context.Context) {
 				continue // a ServerMessage we built ourselves shouldn't fail to marshal
 			}
 			wctx, cancel := context.WithTimeout(ctx, writeTimeout)
-			err = c.ws.Write(wctx, websocket.MessageBinary, data)
+			err = c.ft.WriteFrame(wctx, data)
 			cancel()
 			if err != nil {
 				return // socket wedged/closed — run()'s deferred cancel tears the conn down
@@ -561,7 +566,7 @@ func (c *conn) pingLoop(ctx context.Context) {
 			return
 		case <-t.C:
 			pctx, cancel := context.WithTimeout(ctx, pingTimeout)
-			err := c.ws.Ping(pctx)
+			err := c.ft.Ping(pctx)
 			cancel()
 			if err != nil {
 				return // no pong in time (or shutting down) — exit; run()'s cancel tears down
