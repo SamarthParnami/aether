@@ -1,0 +1,17 @@
+{
+  "name": "@aether/client",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@aether/protocol": "workspace:*",
+    "@bufbuild/protobuf": "^2.12.1"
+  }
+}
