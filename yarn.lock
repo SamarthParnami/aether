@@ -5,7 +5,16 @@ __metadata:
   version: 8
   cacheKey: 10c0
 
-"@aether/protocol@workspace:packages/protocol":
+"@aether/client@workspace:packages/client":
+  version: 0.0.0-use.local
+  resolution: "@aether/client@workspace:packages/client"
+  dependencies:
+    "@aether/protocol": "workspace:*"
+    "@bufbuild/protobuf": "npm:^2.12.1"
+  languageName: unknown
+  linkType: soft
+
+"@aether/protocol@workspace:*, @aether/protocol@workspace:packages/protocol":
   version: 0.0.0-use.local
   resolution: "@aether/protocol@workspace:packages/protocol"
   dependencies:

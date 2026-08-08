@@ -1,0 +1,19 @@
+// CommonJS output -> dist/cjs (the `require` condition).
+//
+// Node10 resolution and verbatimModuleSyntax:false are both forced by the CJS emit: Bundler
+// resolution is only legal with an ESM `module`, and verbatimModuleSyntax forbids rewriting
+// `import` to `require`. Node10 ignores `exports` maps, so any dependency reached from here must
+// still declare `main` — @bufbuild/protobuf does.
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist/cjs",
+    "rootDir": "src",
+    "tsBuildInfoFile": "dist/cjs/.tsbuildinfo",
+    "module": "CommonJS",
+    "moduleResolution": "Node10",
+    "verbatimModuleSyntax": false
+  },
+  "include": ["src"],
+  "exclude": ["src/**/*.test.ts"]
+}
