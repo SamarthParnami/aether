@@ -1,4 +1,11 @@
+// Build solution: `tsc -b` produces both module formats for every package.
+// Typechecking (tests included) runs off each package's own tsconfig.json — see `yarn typecheck`.
 {
   "files": [],
-  "references": [{ "path": "./packages/protocol" }, { "path": "./packages/client" }]
+  "references": [
+    { "path": "./packages/protocol/tsconfig.esm.json" },
+    { "path": "./packages/protocol/tsconfig.cjs.json" },
+    { "path": "./packages/client/tsconfig.esm.json" },
+    { "path": "./packages/client/tsconfig.cjs.json" }
+  ]
 }

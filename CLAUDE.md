@@ -50,7 +50,27 @@ cd go && go test -race ./internal/roomruntime/...  # one package
 cd go && go test -run TestDST_FailoverConvergence ./internal/roomruntime/  # the chaos sweep
 yarn install --immutable && yarn test              # TS (needs `buf generate` first)
 yarn lint && yarn typecheck && yarn format:check   # TS checks (mirror CI)
+yarn verify:dual-build                             # build both formats + load each via require()/import()
 ```
+
+### TS packages ship ESM **and** CommonJS
+
+Each package builds twice — `dist/esm` (the `import` condition) and `dist/cjs` (the `require`
+condition) — so Node tooling can `require('@aether/client')`. Three pieces make it work, and all
+three are load-bearing:
+
+- **`tsconfig.esm.json` / `tsconfig.cjs.json`** per package do the emitting; the package's plain
+  `tsconfig.json` is typecheck-and-editor only (`noEmit`, tests included). The CJS config must
+  override `module`, `moduleResolution` (Node10 — Bundler is illegal with a CJS `module`) and
+  `verbatimModuleSyntax: false` (it otherwise forbids rewriting `import` to `require`).
+- **`scripts/write-dist-type-markers.mjs`** stamps `dist/{esm,cjs}/package.json` with the module
+  `type`. tsc emits `.js` for both formats, so without the marker Node reads `dist/cjs` as ESM
+  (the package is `"type": "module"`) and every `require()` throws.
+- **`scripts/check-dual-build.mjs`** actually loads each package both ways in CI. A wrong `exports`
+  condition or a missing marker builds and typechecks cleanly, then fails at the consumer.
+
+Adding a package? Give it the same three configs and the same `exports` map — the marker script
+picks up any directory under `packages/` automatically.
 
 CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs four lanes: `proto` (buf lint +
 breaking vs `main`), `go` (generate → build → `test -race` → golangci-lint), `ts` (generate →

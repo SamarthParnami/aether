@@ -1,9 +1,17 @@
+// Typecheck + editor/ESLint project: covers everything under src, tests included, and emits
+// nothing. The shipped output is built by tsconfig.esm.json / tsconfig.cjs.json.
+//
+// `paths` points @aether/protocol at its source so typechecking never depends on a prior build
+// (CI runs `yarn typecheck` before `yarn build`).
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "outDir": "dist",
-    "rootDir": "src"
+    "noEmit": true,
+    "composite": false,
+    "declaration": false,
+    "paths": {
+      "@aether/protocol": ["../protocol/src/index.ts"]
+    }
   },
-  "references": [{ "path": "../protocol" }],
   "include": ["src"]
 }

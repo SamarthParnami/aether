@@ -1,0 +1,12 @@
+// ESM output -> dist/esm (the `import` condition). Tests are excluded from the shipped build.
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist/esm",
+    "rootDir": "src",
+    "tsBuildInfoFile": "dist/esm/.tsbuildinfo"
+  },
+  "references": [{ "path": "../protocol/tsconfig.esm.json" }],
+  "include": ["src"],
+  "exclude": ["src/**/*.test.ts"]
+}

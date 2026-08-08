@@ -12,8 +12,9 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "tsc -b",
-    "typecheck": "tsc -b",
+    "build": "tsc -b && node scripts/write-dist-type-markers.mjs",
+    "typecheck": "tsc -p packages/protocol/tsconfig.json && tsc -p packages/client/tsconfig.json",
+    "verify:dual-build": "yarn build && node scripts/check-dual-build.mjs",
     "test": "vitest run",
     "test:cov": "vitest run --coverage",
     "lint": "eslint .",

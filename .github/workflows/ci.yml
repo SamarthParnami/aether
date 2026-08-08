@@ -77,6 +77,8 @@ jobs:
       - run: yarn typecheck
       - run: yarn test
       - run: yarn format:check
+      # Builds both module formats and loads each package via require() AND import().
+      - run: yarn verify:dual-build
 
   pr-title:
     name: pr-title

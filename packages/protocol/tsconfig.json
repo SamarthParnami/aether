@@ -1,8 +1,11 @@
+// Typecheck + editor/ESLint project: covers everything under src, tests included, and emits
+// nothing. The shipped output is built by tsconfig.esm.json / tsconfig.cjs.json.
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "outDir": "dist",
-    "rootDir": "src"
+    "noEmit": true,
+    "composite": false,
+    "declaration": false
   },
   "include": ["src"]
 }

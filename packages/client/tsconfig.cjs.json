@@ -1,0 +1,16 @@
+// CommonJS output -> dist/cjs (the `require` condition). See protocol/tsconfig.cjs.json for why
+// Node10 resolution and verbatimModuleSyntax:false are required here.
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist/cjs",
+    "rootDir": "src",
+    "tsBuildInfoFile": "dist/cjs/.tsbuildinfo",
+    "module": "CommonJS",
+    "moduleResolution": "Node10",
+    "verbatimModuleSyntax": false
+  },
+  "references": [{ "path": "../protocol/tsconfig.cjs.json" }],
+  "include": ["src"],
+  "exclude": ["src/**/*.test.ts"]
+}
