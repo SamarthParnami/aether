@@ -12,13 +12,15 @@
  * dedup key, so a resend of an already-applied commit is a server-side no-op. `broadcast()` is the
  * lossy ephemeral tier.
  *
- * Recovery (S4a): a dropped connection is NOT fatal. The Room re-dials with backoff and re-Joins from
- * its cursor (`from_seq = cursor`) — the gateway resumes the event stream (or hands back a fresh
- * snapshot on a deep resume) — then re-sends every still-outstanding commit. Because commits dedup on
- * `(client_id, client_seq)`, replaying ones that already applied before the drop is exactly-once, not
- * a double-apply — the same property the Go DST commit-chaos gate proves. Only an explicit `close()`
- * stops reconnection and rejects what's in flight. (In-place FROZEN/LIVE recovery without a socket
- * drop, and the retry-timer backstop, are S4b.)
+ * Recovery has two paths, both of which re-drive un-acked commits, and both exactly-once because of
+ * the dedup key:
+ *  - **Reconnect (S4a):** a dropped socket → re-dial with backoff → re-Join from the cursor → resend.
+ *  - **In-place (S4b):** the socket stays up but the room's owner failed over — surfaced as
+ *    `RoomStatus` FROZEN→LIVE. Un-acked commits are re-driven by a retry timer that fires regardless
+ *    of FROZEN/LIVE. That "don't gate resends on LIVE" rule is load-bearing: the gateway relay only
+ *    signals LIVE after it sees an event past the cursor, and that event may be our own commit — so
+ *    waiting for LIVE before resending would deadlock (the property the Go DST commit-chaos gate
+ *    proves). The timer breaks it. Only an explicit `close()` stops recovery and rejects what's live.
  */
 import {
   ClientMessageSchema,
@@ -31,6 +33,8 @@ import {
   type MaterializedState,
   type Nack,
   NackReason,
+  type RoomStatus,
+  RoomStatus_Status,
   type ServerMessage,
 } from '@aether/protocol';
 import { create, type MessageInitShape } from '@bufbuild/protobuf';
@@ -55,8 +59,12 @@ export interface RoomOptions {
   onError?: (code: string, message: string) => void;
   /** Invoked for each received Ephemeral (another client's broadcast). Lossy — best-effort only. */
   onEphemeral?: (originClientId: string, body: EphemeralBody) => void;
+  /** Invoked when the room's live/frozen status changes (false = FROZEN / re-homing). */
+  onStatus?: (live: boolean) => void;
   /** Backoff before reconnect attempt `n` (0-based), in ms. Default: exponential 100ms→5s cap. */
   reconnectDelayMs?: (attempt: number) => number;
+  /** Interval to re-drive un-acked commits while any are outstanding, in ms. Default 5000; 0 disables. */
+  commitRetryMs?: number;
 }
 
 /** Notified after each applied state change; read the latest via {@link Room.getState}. */
@@ -87,7 +95,9 @@ export class Room {
   private readonly nonce: string;
   private readonly onError: ((code: string, message: string) => void) | undefined;
   private readonly onEphemeral: ((originClientId: string, body: EphemeralBody) => void) | undefined;
+  private readonly onStatus: ((live: boolean) => void) | undefined;
   private readonly reconnectDelayMs: (attempt: number) => number;
+  private readonly commitRetryMs: number;
 
   private transport: Transport | undefined;
   private state: MaterializedState = emptyState();
@@ -95,10 +105,12 @@ export class Room {
   private version = 0; // bumped on every state change — the useSyncExternalStore snapshot (S5)
   private clientIdValue: string | undefined;
   private clientSeq = 0n; // last assigned per-client commit sequence
+  private liveValue = false;
 
   private closedByUser = false;
   private reconnectAttempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  private retryTimer: ReturnType<typeof setTimeout> | undefined;
 
   private joinWaiter: Waiter | undefined;
   private readonly pings = new Map<string, Waiter>();
@@ -111,7 +123,9 @@ export class Room {
     this.nonce = opts.sessionNonce ?? crypto.randomUUID();
     this.onError = opts.onError;
     this.onEphemeral = opts.onEphemeral;
+    this.onStatus = opts.onStatus;
     this.reconnectDelayMs = opts.reconnectDelayMs ?? defaultBackoff;
+    this.commitRetryMs = opts.commitRetryMs ?? 5000;
   }
 
   /** Dial, Join, and resolve on the first Joined. Drops thereafter auto-reconnect (see class docs). */
@@ -138,6 +152,11 @@ export class Room {
     return this.cursor;
   }
 
+  /** Whether the room is currently LIVE (true) or FROZEN / re-homing (false). */
+  isLive(): boolean {
+    return this.liveValue;
+  }
+
   /** A monotonically increasing state version; changes iff {@link getState} changed. */
   getVersion(): number {
     return this.version;
@@ -152,7 +171,7 @@ export class Room {
   /**
    * Commit a durable event. Resolves when the committed Event fans back to us (fan-out is the ack);
    * rejects with a {@link NackError} if the server refuses it (except `UNAVAILABLE`, which is
-   * transient — the commit stays buffered and is re-sent on recovery). Assigns the next per-client
+   * transient — the commit stays buffered and is re-driven by recovery). Assigns the next per-client
    * `client_seq`, which together with `client_id` is the server's exactly-once dedup key.
    */
   commit(body: EventBody): Promise<void> {
@@ -161,6 +180,7 @@ export class Room {
     return new Promise<void>((resolve, reject) => {
       this.outstanding.set(seq, { body, resolve, reject });
       this.sendCommit(seq, body);
+      this.armRetry();
     });
   }
 
@@ -180,10 +200,8 @@ export class Room {
   /** Stop reconnecting, close the connection, and reject anything in flight. Terminal. */
   close(): void {
     this.closedByUser = true;
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = undefined;
-    }
+    this.clearTimer('reconnectTimer');
+    this.clearTimer('retryTimer');
     this.transport?.close();
     const err = new Error('room closed');
     this.joinWaiter?.reject(err);
@@ -214,6 +232,7 @@ export class Room {
   private onTransportClose(reason?: Error): void {
     // Pings are transient RTT probes — fail them. Outstanding commits SURVIVE for the resend on
     // reconnect (the whole point of recovery). A user close() is handled in close(), not here.
+    this.setLive(false);
     rejectAll(this.pings.values(), reason ?? new Error('connection closed'));
     this.pings.clear();
     this.scheduleReconnect();
@@ -241,6 +260,9 @@ export class Room {
       case 'nack':
         this.onNack(m.body.value);
         break;
+      case 'roomStatus':
+        this.onRoomStatus(m.body.value);
+        break;
       case 'ephemeral':
         if (m.body.value.roomId === this.roomId && m.body.value.body) {
           this.onEphemeral?.(m.body.value.originClientId, m.body.value.body);
@@ -257,7 +279,6 @@ export class Room {
       case 'error':
         this.onError?.(m.body.value.code, m.body.value.message);
         break;
-      // roomStatus (FROZEN/LIVE) drives in-place recovery in S4b.
       default:
         break;
     }
@@ -276,6 +297,7 @@ export class Room {
     // No snapshot ⇒ a resume from our cursor: keep the state we already have; the gateway streams the
     // events after `cursor` to backfill.
     if (j.currentSeq > this.cursor) this.cursor = j.currentSeq;
+    this.setLive(true);
     this.bump();
     this.joinWaiter?.resolve(); // resolves the first connect(); a no-op on later reconnects
     this.joinWaiter = undefined;
@@ -305,17 +327,27 @@ export class Room {
     if (n.roomId !== this.roomId) return;
     const o = this.outstanding.get(n.clientSeq);
     if (!o) return;
-    // UNAVAILABLE = no reachable owner / re-homing: transient. Keep it buffered so recovery re-sends
-    // it. Every other reason is terminal → reject.
+    // UNAVAILABLE = no reachable owner / re-homing: transient. Keep it buffered so the retry timer /
+    // reconnect re-sends it. Every other reason is terminal → reject.
     if (n.reason === NackReason.UNAVAILABLE) return;
     this.outstanding.delete(n.clientSeq);
+    this.stopRetryIfDrained();
     o.reject(new NackError(n.reason));
+  }
+
+  private onRoomStatus(rs: RoomStatus): void {
+    if (rs.roomId !== this.roomId) return;
+    const live = rs.status === RoomStatus_Status.LIVE;
+    this.setLive(live);
+    // On the LIVE edge, re-drive immediately (a fast path over the retry timer).
+    if (live) this.resendOutstanding();
   }
 
   private ackCommit(clientSeq: bigint): void {
     const o = this.outstanding.get(clientSeq);
     if (o) {
       this.outstanding.delete(clientSeq);
+      this.stopRetryIfDrained();
       o.resolve();
     }
   }
@@ -324,10 +356,30 @@ export class Room {
     for (const [seq, o] of this.outstanding) this.sendCommit(seq, o.body);
   }
 
+  // ===== commit retry timer (in-place, drop-less recovery) =====
+
+  private armRetry(): void {
+    if (this.closedByUser || this.retryTimer || this.commitRetryMs <= 0) return;
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = undefined;
+      if (this.outstanding.size === 0) return;
+      this.resendOutstanding();
+      this.armRetry(); // keep re-driving while anything is un-acked
+    }, this.commitRetryMs);
+  }
+
+  private stopRetryIfDrained(): void {
+    if (this.outstanding.size === 0) this.clearTimer('retryTimer');
+  }
+
   // ===== send helpers =====
 
   private send(body: ClientBody): void {
-    this.transport?.send(encodeClientMessage(create(ClientMessageSchema, { body })));
+    try {
+      this.transport?.send(encodeClientMessage(create(ClientMessageSchema, { body })));
+    } catch {
+      // Best-effort: a send racing a transport close/reopen is fine — recovery re-drives it.
+    }
   }
 
   private sendJoin(fromSeq: bigint): void {
@@ -336,6 +388,20 @@ export class Room {
 
   private sendCommit(clientSeq: bigint, body: EventBody): void {
     this.send({ case: 'commit', value: { roomId: this.roomId, clientSeq, body } });
+  }
+
+  private setLive(live: boolean): void {
+    if (this.liveValue === live) return;
+    this.liveValue = live;
+    this.onStatus?.(live);
+  }
+
+  private clearTimer(which: 'reconnectTimer' | 'retryTimer'): void {
+    const t = this[which];
+    if (t !== undefined) {
+      clearTimeout(t);
+      this[which] = undefined;
+    }
   }
 
   private bump(): void {
