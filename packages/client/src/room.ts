@@ -1,20 +1,24 @@
 /**
- * Room — a client's live view of one Aether room over a single connection.
+ * Room — a client's live, self-healing view of one Aether room.
  *
  * `connect()` dials a {@link Transport}, sends a Join, and resolves once the gateway replies Joined
- * (client_id + snapshot + cursor). From there the Room folds each durable Event into a materialized
- * key/value state — the client-side mirror of the Go `roomcore` reducer (shared golden vectors keep
- * the two in lockstep) — and notifies subscribers. `getState()`/`subscribe()` are the useState-like
- * surface the React hook (S5) builds on.
+ * (client_id + snapshot + cursor). The Room folds each durable Event into a materialized key/value
+ * state — the client-side mirror of the Go `roomcore` reducer (shared golden vectors keep them in
+ * lockstep) — and notifies subscribers. `getState()`/`subscribe()` are the useState-like surface the
+ * React hook (S5) builds on.
  *
  * Writing: `commit()` assigns a per-client monotonic `client_seq`, buffers the commit, and resolves
  * when the committed Event fans back to us — "fan-out is the ack". `(client_id, client_seq)` is the
- * dedup key, so a resend of an already-applied commit is a no-op on the server. `broadcast()` is the
- * lossy ephemeral tier: no ack, no dedup, no ordering.
+ * dedup key, so a resend of an already-applied commit is a server-side no-op. `broadcast()` is the
+ * lossy ephemeral tier.
  *
- * This PR (S3) covers commit/ack/Nack + broadcast. Reconnect/recovery (S4) layers on; until then a
- * dropped connection rejects everything in flight (no auto-reconnect), and a room_seq gap is
- * surfaced, never applied out of order.
+ * Recovery (S4a): a dropped connection is NOT fatal. The Room re-dials with backoff and re-Joins from
+ * its cursor (`from_seq = cursor`) — the gateway resumes the event stream (or hands back a fresh
+ * snapshot on a deep resume) — then re-sends every still-outstanding commit. Because commits dedup on
+ * `(client_id, client_seq)`, replaying ones that already applied before the drop is exactly-once, not
+ * a double-apply — the same property the Go DST commit-chaos gate proves. Only an explicit `close()`
+ * stops reconnection and rejects what's in flight. (In-place FROZEN/LIVE recovery without a socket
+ * drop, and the retry-timer backstop, are S4b.)
  */
 import {
   ClientMessageSchema,
@@ -29,13 +33,16 @@ import {
   NackReason,
   type ServerMessage,
 } from '@aether/protocol';
-import { create } from '@bufbuild/protobuf';
+import { create, type MessageInitShape } from '@bufbuild/protobuf';
 
 import { decodeServerMessage, encodeClientMessage } from './codec.js';
 import type { Dialer, Transport } from './transport.js';
 
+/** The `body` oneof init accepted by `create(ClientMessageSchema, { body })` (a concrete case). */
+type ClientBody = NonNullable<MessageInitShape<typeof ClientMessageSchema>['body']>;
+
 export interface RoomOptions {
-  /** Mints the transport for this connection (S4 re-dials through it on reconnect). */
+  /** Mints a fresh transport per (re)connect — the Room re-dials through it on reconnect. */
   dial: Dialer;
   /** The room to join. */
   roomId: string;
@@ -48,6 +55,8 @@ export interface RoomOptions {
   onError?: (code: string, message: string) => void;
   /** Invoked for each received Ephemeral (another client's broadcast). Lossy — best-effort only. */
   onEphemeral?: (originClientId: string, body: EphemeralBody) => void;
+  /** Backoff before reconnect attempt `n` (0-based), in ms. Default: exponential 100ms→5s cap. */
+  reconnectDelayMs?: (attempt: number) => number;
 }
 
 /** Notified after each applied state change; read the latest via {@link Room.getState}. */
@@ -67,8 +76,10 @@ interface Waiter {
 }
 
 interface Outstanding extends Waiter {
-  body: EventBody; // retained for the recovery resend (S4)
+  body: EventBody; // retained so recovery can re-send it
 }
+
+const defaultBackoff = (attempt: number): number => Math.min(5000, 100 * 2 ** attempt);
 
 export class Room {
   private readonly dial: Dialer;
@@ -76,13 +87,18 @@ export class Room {
   private readonly nonce: string;
   private readonly onError: ((code: string, message: string) => void) | undefined;
   private readonly onEphemeral: ((originClientId: string, body: EphemeralBody) => void) | undefined;
+  private readonly reconnectDelayMs: (attempt: number) => number;
 
   private transport: Transport | undefined;
   private state: MaterializedState = emptyState();
-  private cursor = 0n; // highest applied room_seq
+  private cursor = 0n; // highest applied room_seq — the resume point
   private version = 0; // bumped on every state change — the useSyncExternalStore snapshot (S5)
   private clientIdValue: string | undefined;
   private clientSeq = 0n; // last assigned per-client commit sequence
+
+  private closedByUser = false;
+  private reconnectAttempt = 0;
+  private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 
   private joinWaiter: Waiter | undefined;
   private readonly pings = new Map<string, Waiter>();
@@ -95,20 +111,15 @@ export class Room {
     this.nonce = opts.sessionNonce ?? crypto.randomUUID();
     this.onError = opts.onError;
     this.onEphemeral = opts.onEphemeral;
+    this.reconnectDelayMs = opts.reconnectDelayMs ?? defaultBackoff;
   }
 
-  /** Dial, Join from a fresh cursor, and resolve when the gateway replies Joined. */
-  async connect(): Promise<void> {
-    const t = this.dial();
-    this.transport = t;
-    await t.open({
-      onMessage: (d) => this.handle(decodeServerMessage(d)),
-      onClose: (r) => this.handleClose(r),
-    });
+  /** Dial, Join, and resolve on the first Joined. Drops thereafter auto-reconnect (see class docs). */
+  connect(): Promise<void> {
     const joined = new Promise<void>((resolve, reject) => {
       this.joinWaiter = { resolve, reject };
     });
-    this.sendJoin(0n);
+    void this.openConnection();
     return joined;
   }
 
@@ -141,8 +152,8 @@ export class Room {
   /**
    * Commit a durable event. Resolves when the committed Event fans back to us (fan-out is the ack);
    * rejects with a {@link NackError} if the server refuses it (except `UNAVAILABLE`, which is
-   * transient — the commit stays buffered for the recovery resend in S4). Assigns the next
-   * per-client `client_seq`, which together with `client_id` is the server's exactly-once dedup key.
+   * transient — the commit stays buffered and is re-sent on recovery). Assigns the next per-client
+   * `client_seq`, which together with `client_id` is the server's exactly-once dedup key.
    */
   commit(body: EventBody): Promise<void> {
     this.clientSeq += 1n;
@@ -155,52 +166,69 @@ export class Room {
 
   /** Fire-and-forget an ephemeral broadcast (cursors, presence): lossy, unordered, never acked. */
   broadcast(body: EphemeralBody): void {
-    this.transport?.send(
-      encodeClientMessage(
-        create(ClientMessageSchema, {
-          body: { case: 'broadcast', value: { roomId: this.roomId, body } },
-        }),
-      ),
-    );
+    this.send({ case: 'broadcast', value: { roomId: this.roomId, body } });
   }
 
   /** App-level keepalive/RTT probe: resolves when the matching Pong returns. */
   ping(id: string): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       this.pings.set(id, { resolve, reject });
-      this.transport?.send(
-        encodeClientMessage(create(ClientMessageSchema, { body: { case: 'ping', value: { id } } })),
-      );
+      this.send({ case: 'ping', value: { id } });
     });
   }
 
-  /** Close the connection and reject anything in flight. */
+  /** Stop reconnecting, close the connection, and reject anything in flight. Terminal. */
   close(): void {
+    this.closedByUser = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
+    }
     this.transport?.close();
-    this.rejectPending(new Error('room closed'));
+    const err = new Error('room closed');
+    this.joinWaiter?.reject(err);
+    this.joinWaiter = undefined;
+    rejectAll(this.pings.values(), err);
+    this.pings.clear();
+    rejectAll(this.outstanding.values(), err);
+    this.outstanding.clear();
   }
 
-  // ===== internals =====
+  // ===== connection lifecycle =====
 
-  private sendJoin(fromSeq: bigint): void {
-    this.transport?.send(
-      encodeClientMessage(
-        create(ClientMessageSchema, {
-          body: { case: 'join', value: { roomId: this.roomId, fromSeq, sessionNonce: this.nonce } },
-        }),
-      ),
-    );
+  private async openConnection(): Promise<void> {
+    if (this.closedByUser) return;
+    const t = this.dial();
+    this.transport = t;
+    try {
+      await t.open({
+        onMessage: (d) => this.handle(decodeServerMessage(d)),
+        onClose: (r) => this.onTransportClose(r),
+      });
+      this.sendJoin(this.cursor); // 0 on first connect, cursor on resume
+    } catch {
+      this.scheduleReconnect();
+    }
   }
 
-  private sendCommit(clientSeq: bigint, body: EventBody): void {
-    this.transport?.send(
-      encodeClientMessage(
-        create(ClientMessageSchema, {
-          body: { case: 'commit', value: { roomId: this.roomId, clientSeq, body } },
-        }),
-      ),
-    );
+  private onTransportClose(reason?: Error): void {
+    // Pings are transient RTT probes — fail them. Outstanding commits SURVIVE for the resend on
+    // reconnect (the whole point of recovery). A user close() is handled in close(), not here.
+    rejectAll(this.pings.values(), reason ?? new Error('connection closed'));
+    this.pings.clear();
+    this.scheduleReconnect();
   }
+
+  private scheduleReconnect(): void {
+    if (this.closedByUser || this.reconnectTimer) return;
+    const delay = this.reconnectDelayMs(this.reconnectAttempt++);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      void this.openConnection();
+    }, delay);
+  }
+
+  // ===== message handling =====
 
   private handle(m: ServerMessage): void {
     switch (m.body.case) {
@@ -229,7 +257,7 @@ export class Room {
       case 'error':
         this.onError?.(m.body.value.code, m.body.value.message);
         break;
-      // roomStatus (FROZEN/LIVE) drives the recovery layer in S4.
+      // roomStatus (FROZEN/LIVE) drives in-place recovery in S4b.
       default:
         break;
     }
@@ -237,29 +265,34 @@ export class Room {
 
   private onJoined(j: Joined): void {
     this.clientIdValue = j.clientId;
-    this.state = emptyState();
-    this.cursor = 0n;
+    this.reconnectAttempt = 0; // a successful join resets backoff
     if (j.snapshot) {
+      // Fresh join, or a deep resume where our cursor fell below the log's floor: adopt the snapshot
+      // wholesale as the new base.
+      this.state = emptyState();
       for (const [k, v] of Object.entries(j.snapshot.state?.entries ?? {})) this.state.set(k, v);
       this.cursor = j.snapshot.roomSeq;
     }
+    // No snapshot ⇒ a resume from our cursor: keep the state we already have; the gateway streams the
+    // events after `cursor` to backfill.
     if (j.currentSeq > this.cursor) this.cursor = j.currentSeq;
     this.bump();
-    this.joinWaiter?.resolve();
+    this.joinWaiter?.resolve(); // resolves the first connect(); a no-op on later reconnects
     this.joinWaiter = undefined;
+    this.resendOutstanding(); // re-drive un-acked commits through the (re)connected owner
   }
 
   private onEvent(e: Event): void {
     if (e.roomId !== this.roomId) return;
     // Fan-out is the ack: our own committed event returning resolves the outstanding commit — whether
-    // it's a live delivery or a replay during recovery (so an already-applied commit still acks).
+    // a live delivery or a replay during recovery (so an already-applied commit still acks).
     if (e.originClientId === this.clientIdValue) this.ackCommit(e.originClientSeq);
 
     const expected = this.cursor + 1n;
     if (e.roomSeq < expected) return; // already applied — an idempotent replay
     if (e.roomSeq > expected) {
       // A gap: the log skipped ahead. Applying out of order would diverge from the Go reducer, so we
-      // surface it and wait — the cursor-resume path (S4) is what actually backfills the gap.
+      // surface it and wait — a reconnect re-Joins from the cursor and the gateway backfills.
       this.onError?.('seq_gap', `expected room_seq ${expected}, got ${e.roomSeq}`);
       return;
     }
@@ -272,8 +305,8 @@ export class Room {
     if (n.roomId !== this.roomId) return;
     const o = this.outstanding.get(n.clientSeq);
     if (!o) return;
-    // UNAVAILABLE = no reachable owner / re-homing: transient. Keep it buffered so the recovery layer
-    // (S4) resends it once the room is LIVE again. Every other reason is terminal → reject.
+    // UNAVAILABLE = no reachable owner / re-homing: transient. Keep it buffered so recovery re-sends
+    // it. Every other reason is terminal → reject.
     if (n.reason === NackReason.UNAVAILABLE) return;
     this.outstanding.delete(n.clientSeq);
     o.reject(new NackError(n.reason));
@@ -287,23 +320,31 @@ export class Room {
     }
   }
 
-  private handleClose(reason?: Error): void {
-    // S4 turns this into a reconnect (keeping outstanding commits for resend); for now a drop just
-    // fails everything awaiting.
-    this.rejectPending(reason ?? new Error('connection closed'));
+  private resendOutstanding(): void {
+    for (const [seq, o] of this.outstanding) this.sendCommit(seq, o.body);
   }
 
-  private rejectPending(err: Error): void {
-    this.joinWaiter?.reject(err);
-    this.joinWaiter = undefined;
-    for (const w of this.pings.values()) w.reject(err);
-    this.pings.clear();
-    for (const o of this.outstanding.values()) o.reject(err);
-    this.outstanding.clear();
+  // ===== send helpers =====
+
+  private send(body: ClientBody): void {
+    this.transport?.send(encodeClientMessage(create(ClientMessageSchema, { body })));
+  }
+
+  private sendJoin(fromSeq: bigint): void {
+    this.send({ case: 'join', value: { roomId: this.roomId, fromSeq, sessionNonce: this.nonce } });
+  }
+
+  private sendCommit(clientSeq: bigint, body: EventBody): void {
+    this.send({ case: 'commit', value: { roomId: this.roomId, clientSeq, body } });
   }
 
   private bump(): void {
     this.version++;
     for (const fn of this.listeners) fn();
   }
+}
+
+/** Reject a batch of pending waiters with the same error. */
+function rejectAll(waiters: Iterable<Waiter>, err: Error): void {
+  for (const w of waiters) w.reject(err);
 }

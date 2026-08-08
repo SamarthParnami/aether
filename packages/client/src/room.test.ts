@@ -150,11 +150,12 @@ describe('Room', () => {
     await expect(ponged).resolves.toBeUndefined();
   });
 
-  it('rejects an in-flight ping when the connection closes', async () => {
+  it('rejects an in-flight ping when the connection drops (RTT probes are transient)', async () => {
     const { room, server } = await joinedRoom();
     const ponged = room.ping('probe');
     await recvClient(server); // consume the ping
     server.close(new Error('dropped'));
     await expect(ponged).rejects.toThrow(/dropped/);
+    room.close(); // stop the reconnect loop this drop kicked off (see recovery.test.ts)
   });
 });
