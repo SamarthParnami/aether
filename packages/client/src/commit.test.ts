@@ -55,6 +55,26 @@ function ackEvent(roomSeq: bigint, originSeq: bigint, key: string, value: string
     },
   });
 }
+/** A peer's Event — same origin_client_seq as ours, different origin_client_id. */
+function foreignEvent(
+  roomSeq: bigint,
+  originSeq: bigint,
+  key: string,
+  value: string,
+): ServerMessage {
+  return create(ServerMessageSchema, {
+    body: {
+      case: 'event',
+      value: {
+        roomId: 'r',
+        roomSeq,
+        originClientId: 'other',
+        originClientSeq: originSeq,
+        body: kvBody(key, value),
+      },
+    },
+  });
+}
 function nackMsg(clientSeq: bigint, reason: NackReason): ServerMessage {
   return create(ServerMessageSchema, {
     body: { case: 'nack', value: { roomId: 'r', clientSeq, reason } },
@@ -89,15 +109,28 @@ describe('Room commit path', () => {
     expect(room.currentSeq()).toBe(3n);
   });
 
-  it('assigns a monotonic client_seq per commit', async () => {
+  it('assigns a monotonic client_seq and holds the next commit until the previous one acks', async () => {
+    // One commit on the wire at a time. The owner dedups on a per-client HIGH-WATER mark, so if
+    // client_seq 2 reached a new owner while 1 was still buffered, 1 would become permanently
+    // unappliable — its resends silently swallowed as duplicates and its data never logged.
     const { room, server } = await joinedRoom();
     void room.commit(kvBody('a', '1')).catch(() => {});
     void room.commit(kvBody('b', '2')).catch(() => {});
 
     const seqOf = (m: ClientMessage) => (m.body.case === 'commit' ? m.body.value.clientSeq : -1n);
     expect(seqOf(await recvClient(server))).toBe(1n);
-    expect(seqOf(await recvClient(server))).toBe(2n);
-    room.close(); // drain the (un-acked) commits' retry timer
+
+    // 2 must NOT be on the wire yet — prove it stays held across a full macrotask.
+    let second: ClientMessage | undefined;
+    void recvClient(server).then((m) => (second = m));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(second).toBeUndefined();
+
+    // Acking 1 releases 2, with its sequence intact.
+    sendServer(server, ackEvent(3n, 1n, 'a', '1'));
+    await vi.waitFor(() => expect(second).toBeDefined());
+    expect(seqOf(second as ClientMessage)).toBe(2n);
+    room.close(); // drain the (un-acked) commit's retry timer
   });
 
   it('rejects a commit the server Nacks with a NackError carrying the reason', async () => {
@@ -217,6 +250,28 @@ describe('Room commit path', () => {
 
     sendServer(server, nackMsg(999n, NackReason.INVALID)); // unknown seq → no-op
     sendServer(server, ackEvent(3n, 1n, 'a', '1')); // the real commit still acks
+    await expect(done).resolves.toBeUndefined();
+    room.close();
+  });
+
+  it('does not ack our commit on a peer Event carrying the same origin_client_seq', async () => {
+    // Every client's client_seq starts at 1n, so a peer's first commit fans out as
+    // (origin='other', origin_client_seq=1) — identical to ours but for the id. Matching on the seq
+    // alone would tell the app its write is durable when it was never appended.
+    const { room, server } = await joinedRoom();
+    const done = room.commit(kvBody('mine', '1')); // client_seq 1
+    await recvClient(server);
+
+    let settled = false;
+    void done.then(
+      () => (settled = true),
+      () => (settled = true),
+    );
+    sendServer(server, foreignEvent(3n, 1n, 'theirs', 'x')); // same seq, foreign origin
+    await new Promise((r) => setTimeout(r, 0));
+    expect(settled).toBe(false); // must NOT have acked
+
+    sendServer(server, ackEvent(4n, 1n, 'mine', '1')); // our own event does ack it
     await expect(done).resolves.toBeUndefined();
     room.close();
   });

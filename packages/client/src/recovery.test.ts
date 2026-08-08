@@ -3,13 +3,14 @@ import {
   ClientMessageSchema,
   type EventBody,
   EventBodySchema,
+  NackReason,
   type ServerMessage,
   ServerMessageSchema,
 } from '@aether/protocol';
 import { create, fromBinary, toBinary } from '@bufbuild/protobuf';
 import { describe, expect, it, vi } from 'vitest';
 
-import { Room } from './room.js';
+import { CommitUnconfirmedError, Room } from './room.js';
 import { type Dialer, memoryTransportPair, type ServerEnd } from './transport.js';
 
 const enc = (s: string) => new TextEncoder().encode(s);
@@ -82,8 +83,18 @@ function ackEvent(roomSeq: bigint, originSeq: bigint, key: string, value: string
   });
 }
 
+function errorMsg(code: string, message: string): ServerMessage {
+  return create(ServerMessageSchema, { body: { case: 'error', value: { code, message } } });
+}
+function nackMsg(clientSeq: bigint, reason: NackReason): ServerMessage {
+  return create(ServerMessageSchema, {
+    body: { case: 'nack', value: { roomId: 'r', clientSeq, reason } },
+  });
+}
+
 const fromSeqOf = (m: ClientMessage) => (m.body.case === 'join' ? m.body.value.fromSeq : -1n);
 const commitSeqOf = (m: ClientMessage) => (m.body.case === 'commit' ? m.body.value.clientSeq : -1n);
+const nonceOf = (m: ClientMessage) => (m.body.case === 'join' ? m.body.value.sessionNonce : '');
 
 describe('Room recovery', () => {
   it('reconnects, resumes from the cursor, and re-sends the outstanding commit (exactly-once)', async () => {
@@ -103,8 +114,14 @@ describe('Room recovery', () => {
 
     // Reconnect re-Joins from the cursor, and the buffered commit is re-sent on the new owner.
     await waitForServer(servers, 2);
-    expect(fromSeqOf(await recvClient(serverAt(servers, 1)))).toBe(2n); // resumed, not from zero
+    const rejoin = await recvClient(serverAt(servers, 1));
+    expect(fromSeqOf(rejoin)).toBe(2n); // resumed, not from zero
+    // The nonce MUST be the one we joined with: the gateway derives client_id = HMAC(principal,
+    // session_nonce), so a fresh nonce here would mint a new client_id, miss the owner's
+    // (client_id, client_seq) dedup high-water, and apply the re-sent commit A SECOND TIME.
+    expect(nonceOf(rejoin)).toBe('n');
     sendServer(serverAt(servers, 1), joinedResume(2n));
+    expect(room.clientId()).toBe('c1');
     expect(commitSeqOf(await recvClient(serverAt(servers, 1)))).toBe(1n); // same client_seq re-sent
 
     // The new owner acks it (dedup makes a re-apply exactly-once); state advances once.
@@ -213,7 +230,166 @@ describe('Room recovery', () => {
     room.close();
   });
 
-  it('resolves an outstanding commit subsumed by a deep-resume snapshot (ack via re-fanout)', async () => {
+  it('reuses a generated session nonce across reconnects', async () => {
+    // Same invariant as above, for the path where the SDK mints the nonce itself.
+    const { dial, servers } = harness();
+    const room = new Room({ dial, roomId: 'r', reconnectDelayMs: () => 0 });
+    const connected = room.connect();
+
+    await waitForServer(servers, 1);
+    const first = nonceOf(await recvClient(serverAt(servers, 0)));
+    expect(first).not.toBe('');
+    sendServer(serverAt(servers, 0), joinedSnapshot(2n, {}));
+    await connected;
+
+    serverAt(servers, 0).close(new Error('drop'));
+    await waitForServer(servers, 2);
+    expect(nonceOf(await recvClient(serverAt(servers, 1)))).toBe(first);
+
+    room.close();
+  });
+
+  it('retries the Join when the gateway answers it with a transient Error (socket stays open)', async () => {
+    // The gateway's no-owner path replies Error{UNAVAILABLE} and returns WITHOUT starting a relay,
+    // leaving the WebSocket open — so no onClose fires and nothing else would ever retry.
+    const { dial, servers } = harness();
+    const codes: string[] = [];
+    const room = new Room({
+      dial,
+      roomId: 'r',
+      sessionNonce: 'n',
+      reconnectDelayMs: () => 0,
+      onError: (c) => codes.push(c),
+    });
+    const connected = room.connect();
+
+    await waitForServer(servers, 1);
+    await recvClient(serverAt(servers, 0));
+    sendServer(serverAt(servers, 0), errorMsg('UNAVAILABLE', 'room has no reachable owner'));
+
+    // A second connection is dialed and re-Joins; the room comes up once the owner is placed.
+    await waitForServer(servers, 2);
+    expect(fromSeqOf(await recvClient(serverAt(servers, 1)))).toBe(0n);
+    sendServer(serverAt(servers, 1), joinedSnapshot(2n, { slide: '7' }));
+    await expect(connected).resolves.toBeUndefined();
+    expect(codes).toEqual(['UNAVAILABLE']); // still surfaced to the app
+    expect(room.isLive()).toBe(true);
+
+    room.close();
+  });
+
+  it('fails connect() and stops retrying when the Join is rejected as INVALID', async () => {
+    // INVALID = malformed frame / bad or mismatched session_nonce. Retrying cannot help.
+    const { dial, servers } = harness();
+    const room = new Room({ dial, roomId: 'r', sessionNonce: 'n', reconnectDelayMs: () => 0 });
+    const connected = room.connect();
+
+    await waitForServer(servers, 1);
+    await recvClient(serverAt(servers, 0));
+    sendServer(serverAt(servers, 0), errorMsg('INVALID', 'session_nonce required'));
+
+    await expect(connected).rejects.toThrow(/join rejected: INVALID/);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(servers).toHaveLength(1); // no reconnect storm against a request that can never succeed
+  });
+
+  it('keeps a commit buffered on a transient NOT_JOINED Nack and re-drives it after the Join', async () => {
+    // NOT_JOINED means this connection has no relay for the room yet — transient during a re-home,
+    // not a refusal. Rejecting it turned a survivable failover into a permanent write failure.
+    const { dial, servers } = harness();
+    const room = new Room({
+      dial,
+      roomId: 'r',
+      sessionNonce: 'n',
+      reconnectDelayMs: () => 0,
+      commitRetryMs: 5,
+    });
+    const connected = room.connect();
+
+    await waitForServer(servers, 1);
+    await recvClient(serverAt(servers, 0));
+    sendServer(serverAt(servers, 0), joinedSnapshot(2n, {}));
+    await connected;
+
+    const done = room.commit(kvBody('a', '1'));
+    expect(commitSeqOf(await recvClient(serverAt(servers, 0)))).toBe(1n);
+
+    let settled = false;
+    void done.then(
+      () => (settled = true),
+      () => (settled = true),
+    );
+    sendServer(serverAt(servers, 0), nackMsg(1n, NackReason.NOT_JOINED));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(settled).toBe(false); // buffered, not rejected
+
+    // The retry timer re-drives it on the same connection, and it acks normally.
+    expect(commitSeqOf(await recvClient(serverAt(servers, 0)))).toBe(1n);
+    sendServer(serverAt(servers, 0), ackEvent(3n, 1n, 'a', '1'));
+    await expect(done).resolves.toBeUndefined();
+
+    room.close();
+  });
+
+  it('rejects a ping issued while disconnected instead of hanging on a dead transport', async () => {
+    const { dial, servers } = harness();
+    const room = new Room({
+      dial,
+      roomId: 'r',
+      sessionNonce: 'n',
+      reconnectDelayMs: () => 60_000, // park the reconnect so we stay disconnected
+    });
+    const connected = room.connect();
+
+    await waitForServer(servers, 1);
+    await recvClient(serverAt(servers, 0));
+    sendServer(serverAt(servers, 0), joinedSnapshot(2n, {}));
+    await connected;
+
+    serverAt(servers, 0).close(new Error('drop'));
+    await vi.waitFor(() => expect(room.isLive()).toBe(false));
+
+    // Previously this parked a waiter that never settled AND poisoned the id forever.
+    await expect(room.ping('hb')).rejects.toThrow(/not connected/);
+    await expect(room.ping('hb')).rejects.toThrow(/not connected/); // id is reusable, not poisoned
+
+    room.close();
+  });
+
+  it('gives up on a commit the owner can never re-fan, with an explicit unconfirmed outcome', async () => {
+    // A commit subsumed by a reconnect's snapshot is deduped by the owner and never re-fanned, so
+    // fan-out-is-the-ack has no path. Joined carries no per-client dedup high-water, so the SDK
+    // cannot tell "already durable" from "never applied" — it must stop and say so.
+    const { dial, servers } = harness();
+    const room = new Room({
+      dial,
+      roomId: 'r',
+      sessionNonce: 'n',
+      reconnectDelayMs: () => 0,
+      commitRetryMs: 1,
+      commitMaxAttempts: 3,
+    });
+    const connected = room.connect();
+
+    await waitForServer(servers, 1);
+    await recvClient(serverAt(servers, 0));
+    sendServer(serverAt(servers, 0), joinedSnapshot(0n, {}));
+    await connected;
+
+    const done = room.commit(kvBody('slide', '9'));
+    // The server never acks — exactly what a deduped resend looks like on the wire.
+    await expect(done).rejects.toBeInstanceOf(CommitUnconfirmedError);
+    await expect(done).rejects.toThrow(/may or may not be durable/);
+
+    room.close();
+  });
+
+  // NOTE: this pins the SDK's ack-before-gate rule — an Event whose room_seq is already ≤ our cursor
+  // still acks — for the case where an owner DOES re-fan a subsumed commit. It is not a claim that
+  // the Go owner guarantees that: roomruntime.Tail streams strictly room_seq > from_seq, so a commit
+  // subsumed by the Join snapshot is normally never re-delivered. That path is the preceding
+  // CommitUnconfirmedError test.
+  it('resolves an outstanding commit subsumed by a deep-resume snapshot, if the owner re-fans it', async () => {
     const { dial, servers } = harness();
     const room = new Room({ dial, roomId: 'r', sessionNonce: 'n', reconnectDelayMs: () => 0 });
     const connected = room.connect();
