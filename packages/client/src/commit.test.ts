@@ -203,6 +203,14 @@ describe('Room commit path', () => {
     await expect(done).rejects.toThrow(/room closed/);
   });
 
+  it('rejects a commit issued after close() instead of parking it forever', async () => {
+    // A closed Room re-drives nothing: send() is a no-op with no transport and armRetry() refuses to
+    // arm, so a parked waiter here could never settle.
+    const { room } = await joinedRoom();
+    room.close();
+    await expect(room.commit(kvBody('a', '1'))).rejects.toThrow(/room closed/);
+  });
+
   it('ignores an Ephemeral with no body or a mismatched room', async () => {
     const seen: string[] = [];
     const { room, server } = await joinedRoom({

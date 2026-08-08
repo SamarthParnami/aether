@@ -149,6 +149,7 @@ export class Room {
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private retryTimer: ReturnType<typeof setTimeout> | undefined;
 
+  private connecting: Promise<void> | undefined; // the one connect() promise; makes connect() idempotent
   private joinWaiter: Waiter | undefined;
   private readonly pings = new Map<string, Waiter>();
   private readonly outstanding = new Map<bigint, Outstanding>(); // client_seq → un-acked commit
@@ -166,13 +167,23 @@ export class Room {
     this.commitMaxAttempts = opts.commitMaxAttempts ?? 10;
   }
 
-  /** Dial, Join, and resolve on the first Joined. Drops thereafter auto-reconnect (see class docs). */
+  /**
+   * Dial, Join, and resolve on the first Joined. Drops thereafter auto-reconnect (see class docs).
+   *
+   * Idempotent: repeat calls return the SAME promise rather than dialing again. A second dial used
+   * to overwrite `this.transport`, orphaning a fully-wired socket that nobody would ever close — and
+   * when that orphan later dropped, its `onTransportClose` cleared the pointer to the *healthy*
+   * connection, black-holing writes and reporting FROZEN over a live link. It also overwrote
+   * `joinWaiter`, so the first caller's promise could never settle.
+   */
   connect(): Promise<void> {
-    const joined = new Promise<void>((resolve, reject) => {
+    if (this.closedByUser) return Promise.reject(new Error('room closed'));
+    if (this.connecting) return this.connecting;
+    this.connecting = new Promise<void>((resolve, reject) => {
       this.joinWaiter = { resolve, reject };
     });
     void this.openConnection();
-    return joined;
+    return this.connecting;
   }
 
   /** The materialized room state (last-write-wins key/value). Treat as read-only. */
@@ -213,6 +224,11 @@ export class Room {
    * `client_seq`, which together with `client_id` is the server's exactly-once dedup key.
    */
   commit(body: EventBody): Promise<void> {
+    // A closed Room can never re-drive anything: send() is a no-op with no transport and armRetry()
+    // refuses to arm, so parking a waiter here would leave the promise unsettled forever. Reject
+    // before burning a client_seq. Note `closedByUser` is also set by a terminal INVALID Join, so
+    // this covers an app whose connect() failed and which never called close() itself.
+    if (this.closedByUser) return Promise.reject(new Error('room closed'));
     this.clientSeq += 1n;
     const seq = this.clientSeq;
     return new Promise<void>((resolve, reject) => {
@@ -267,6 +283,11 @@ export class Room {
 
   private async openConnection(): Promise<void> {
     if (this.closedByUser) return;
+    // Defence in depth: never assign over a live transport without closing it. connect() is now
+    // idempotent and the reconnect path is guarded by reconnectTimer, so this should be unreachable —
+    // but an orphaned socket stays wired to our handlers, and its eventual drop would clear the
+    // pointer to the healthy one.
+    this.transport?.close();
     const t = this.dial();
     this.transport = t;
     try {

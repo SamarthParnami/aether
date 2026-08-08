@@ -293,6 +293,44 @@ describe('Room recovery', () => {
     expect(servers).toHaveLength(1); // no reconnect storm against a request that can never succeed
   });
 
+  it('connect() is idempotent: a second call dials once more and both promises settle', async () => {
+    // A second dial used to orphan a fully-wired socket. Worse, the orphan stayed attached to our
+    // handlers, so its eventual drop cleared the pointer to the HEALTHY connection — writes went
+    // nowhere and the app was told FROZEN over a live link.
+    const { dial, servers } = harness();
+    const room = new Room({ dial, roomId: 'r', sessionNonce: 'n', reconnectDelayMs: () => 0 });
+
+    const a = room.connect();
+    const b = room.connect();
+
+    await waitForServer(servers, 1);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(servers).toHaveLength(1); // exactly one transport dialed
+
+    await recvClient(serverAt(servers, 0));
+    sendServer(serverAt(servers, 0), joinedSnapshot(2n, {}));
+    await expect(a).resolves.toBeUndefined();
+    await expect(b).resolves.toBeUndefined(); // the first caller's promise is not orphaned
+
+    room.close();
+  });
+
+  it('rejects commit() and connect() on a room closed by a terminal INVALID join', async () => {
+    // onServerError's INVALID branch marks the Room terminal WITHOUT the app calling close(), so a
+    // later commit() had nothing left to re-drive it and parked forever.
+    const { dial, servers } = harness();
+    const room = new Room({ dial, roomId: 'r', sessionNonce: 'n', reconnectDelayMs: () => 0 });
+    const connected = room.connect();
+
+    await waitForServer(servers, 1);
+    await recvClient(serverAt(servers, 0));
+    sendServer(serverAt(servers, 0), errorMsg('INVALID', 'session_nonce required'));
+    await expect(connected).rejects.toThrow(/join rejected: INVALID/);
+
+    await expect(room.commit(kvBody('a', '1'))).rejects.toThrow(/room closed/);
+    await expect(room.connect()).rejects.toThrow(/room closed/);
+  });
+
   it('keeps a commit buffered on a transient NOT_JOINED Nack and re-drives it after the Join', async () => {
     // NOT_JOINED means this connection has no relay for the room yet — transient during a re-home,
     // not a refusal. Rejecting it turned a survivable failover into a permanent write failure.
