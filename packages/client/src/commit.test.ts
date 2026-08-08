@@ -55,6 +55,26 @@ function ackEvent(roomSeq: bigint, originSeq: bigint, key: string, value: string
     },
   });
 }
+/** A peer's Event — same origin_client_seq as ours, different origin_client_id. */
+function foreignEvent(
+  roomSeq: bigint,
+  originSeq: bigint,
+  key: string,
+  value: string,
+): ServerMessage {
+  return create(ServerMessageSchema, {
+    body: {
+      case: 'event',
+      value: {
+        roomId: 'r',
+        roomSeq,
+        originClientId: 'other',
+        originClientSeq: originSeq,
+        body: kvBody(key, value),
+      },
+    },
+  });
+}
 function nackMsg(clientSeq: bigint, reason: NackReason): ServerMessage {
   return create(ServerMessageSchema, {
     body: { case: 'nack', value: { roomId: 'r', clientSeq, reason } },
@@ -89,15 +109,28 @@ describe('Room commit path', () => {
     expect(room.currentSeq()).toBe(3n);
   });
 
-  it('assigns a monotonic client_seq per commit', async () => {
+  it('assigns a monotonic client_seq and holds the next commit until the previous one acks', async () => {
+    // One commit on the wire at a time. The owner dedups on a per-client HIGH-WATER mark, so if
+    // client_seq 2 reached a new owner while 1 was still buffered, 1 would become permanently
+    // unappliable — its resends silently swallowed as duplicates and its data never logged.
     const { room, server } = await joinedRoom();
     void room.commit(kvBody('a', '1')).catch(() => {});
     void room.commit(kvBody('b', '2')).catch(() => {});
 
     const seqOf = (m: ClientMessage) => (m.body.case === 'commit' ? m.body.value.clientSeq : -1n);
     expect(seqOf(await recvClient(server))).toBe(1n);
-    expect(seqOf(await recvClient(server))).toBe(2n);
-    room.close(); // drain the (un-acked) commits' retry timer
+
+    // 2 must NOT be on the wire yet — prove it stays held across a full macrotask.
+    let second: ClientMessage | undefined;
+    void recvClient(server).then((m) => (second = m));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(second).toBeUndefined();
+
+    // Acking 1 releases 2, with its sequence intact.
+    sendServer(server, ackEvent(3n, 1n, 'a', '1'));
+    await vi.waitFor(() => expect(second).toBeDefined());
+    expect(seqOf(second as ClientMessage)).toBe(2n);
+    room.close(); // drain the (un-acked) commit's retry timer
   });
 
   it('rejects a commit the server Nacks with a NackError carrying the reason', async () => {
@@ -168,5 +201,100 @@ describe('Room commit path', () => {
     await recvClient(server);
     room.close();
     await expect(done).rejects.toThrow(/room closed/);
+  });
+
+  it('rejects a commit issued after close() instead of parking it forever', async () => {
+    // A closed Room re-drives nothing: send() is a no-op with no transport and armRetry() refuses to
+    // arm, so a parked waiter here could never settle.
+    const { room } = await joinedRoom();
+    room.close();
+    await expect(room.commit(kvBody('a', '1'))).rejects.toThrow(/room closed/);
+  });
+
+  it('ignores an Ephemeral with no body or a mismatched room', async () => {
+    const seen: string[] = [];
+    const { room, server } = await joinedRoom({
+      onEphemeral: (_id, body) => {
+        if (body.kind.case === 'kvSet') seen.push(dec(body.kind.value.value) ?? '');
+      },
+    });
+
+    // No body → skipped.
+    sendServer(
+      server,
+      create(ServerMessageSchema, {
+        body: { case: 'ephemeral', value: { roomId: 'r', originClientId: 'peer' } },
+      }),
+    );
+    // Wrong room → skipped.
+    sendServer(
+      server,
+      create(ServerMessageSchema, {
+        body: {
+          case: 'ephemeral',
+          value: { roomId: 'other', originClientId: 'peer', body: kvEph('c', '1') },
+        },
+      }),
+    );
+    // A valid one → delivered, proving the stream still flows past the skipped frames.
+    sendServer(
+      server,
+      create(ServerMessageSchema, {
+        body: {
+          case: 'ephemeral',
+          value: { roomId: 'r', originClientId: 'peer', body: kvEph('c', '9') },
+        },
+      }),
+    );
+
+    await vi.waitFor(() => expect(seen).toEqual(['9']));
+    room.close();
+  });
+
+  it('ignores a Nack for an unknown client_seq (no throw, no effect on other commits)', async () => {
+    const { room, server } = await joinedRoom();
+    const done = room.commit(kvBody('a', '1')); // client_seq 1
+    await recvClient(server);
+
+    sendServer(server, nackMsg(999n, NackReason.INVALID)); // unknown seq → no-op
+    sendServer(server, ackEvent(3n, 1n, 'a', '1')); // the real commit still acks
+    await expect(done).resolves.toBeUndefined();
+    room.close();
+  });
+
+  it('does not ack our commit on a peer Event carrying the same origin_client_seq', async () => {
+    // Every client's client_seq starts at 1n, so a peer's first commit fans out as
+    // (origin='other', origin_client_seq=1) — identical to ours but for the id. Matching on the seq
+    // alone would tell the app its write is durable when it was never appended.
+    const { room, server } = await joinedRoom();
+    const done = room.commit(kvBody('mine', '1')); // client_seq 1
+    await recvClient(server);
+
+    let settled = false;
+    void done.then(
+      () => (settled = true),
+      () => (settled = true),
+    );
+    sendServer(server, foreignEvent(3n, 1n, 'theirs', 'x')); // same seq, foreign origin
+    await new Promise((r) => setTimeout(r, 0));
+    expect(settled).toBe(false); // must NOT have acked
+
+    sendServer(server, ackEvent(4n, 1n, 'mine', '1')); // our own event does ack it
+    await expect(done).resolves.toBeUndefined();
+    room.close();
+  });
+
+  it('does not double-resolve on a duplicate fan-out of the same commit', async () => {
+    const { room, server } = await joinedRoom();
+    let resolves = 0;
+    const done = room.commit(kvBody('a', '1')).then(() => resolves++);
+    await recvClient(server);
+
+    sendServer(server, ackEvent(3n, 1n, 'a', '1')); // ack
+    sendServer(server, ackEvent(3n, 1n, 'a', '1')); // duplicate fan-out → must be a no-op
+    await done;
+    await new Promise((r) => setTimeout(r, 0));
+    expect(resolves).toBe(1);
+    room.close();
   });
 });

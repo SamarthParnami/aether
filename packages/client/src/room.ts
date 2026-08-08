@@ -21,6 +21,14 @@
  *    signals LIVE after it sees an event past the cursor, and that event may be our own commit — so
  *    waiting for LIVE before resending would deadlock (the property the Go DST commit-chaos gate
  *    proves). The timer breaks it. Only an explicit `close()` stops recovery and rejects what's live.
+ *  - **Failed Join:** the gateway can reject a Join with an `Error` frame while leaving the socket
+ *    OPEN (its no-owner path), so no drop is observed. A transient code re-dials through the backoff;
+ *    `INVALID` is terminal and fails `connect()`.
+ *
+ * Commits go out strictly ONE AT A TIME (see `sendHead`) — the owner's per-client high-water dedup
+ * makes an out-of-order arrival unrecoverable, so a queue is the only safe shape. A commit that can
+ * never be acked (already deduped by the owner, so never re-fanned) fails with
+ * {@link CommitUnconfirmedError} rather than retrying forever.
  */
 import {
   ClientMessageSchema,
@@ -65,6 +73,12 @@ export interface RoomOptions {
   reconnectDelayMs?: (attempt: number) => number;
   /** Interval to re-drive un-acked commits while any are outstanding, in ms. Default 5000; 0 disables. */
   commitRetryMs?: number;
+  /**
+   * How many times a single commit may be sent before it is rejected with a
+   * {@link CommitUnconfirmedError}. Default 10; 0 means never give up (the pre-1.0 behaviour, which
+   * can loop forever against a commit the owner has already deduped).
+   */
+  commitMaxAttempts?: number;
 }
 
 /** Notified after each applied state change; read the latest via {@link Room.getState}. */
@@ -85,6 +99,26 @@ interface Waiter {
 
 interface Outstanding extends Waiter {
   body: EventBody; // retained so recovery can re-send it
+  attempts: number; // sends so far, so an unackable commit fails loudly instead of looping forever
+}
+
+/**
+ * A commit that was re-sent {@link RoomOptions.commitMaxAttempts} times without ever being acked.
+ *
+ * This is the honest answer to an ambiguity the wire protocol cannot currently resolve: if a
+ * reconnect's Join returns a snapshot that already subsumes the commit, the owner dedups every
+ * resend and never re-fans the event, so "fan-out is the ack" has no path left. `Joined` carries no
+ * per-client dedup high-water, so the SDK cannot tell "already durable" from "never applied".
+ * The write is in an UNKNOWN state — the app must reconcile against room state, not retry blindly.
+ */
+export class CommitUnconfirmedError extends Error {
+  constructor(readonly clientSeq: bigint) {
+    super(
+      `commit ${clientSeq} was never acknowledged after the maximum number of attempts; ` +
+        `it may or may not be durable — reconcile against room state`,
+    );
+    this.name = 'CommitUnconfirmedError';
+  }
 }
 
 const defaultBackoff = (attempt: number): number => Math.min(5000, 100 * 2 ** attempt);
@@ -98,6 +132,7 @@ export class Room {
   private readonly onStatus: ((live: boolean) => void) | undefined;
   private readonly reconnectDelayMs: (attempt: number) => number;
   private readonly commitRetryMs: number;
+  private readonly commitMaxAttempts: number;
 
   private transport: Transport | undefined;
   private state: MaterializedState = emptyState();
@@ -108,10 +143,13 @@ export class Room {
   private liveValue = false;
 
   private closedByUser = false;
+  private joinPending = false; // a Join is on the wire and no Joined has come back yet
+  private inFlight: bigint | undefined; // the one commit currently on the wire (see sendHead)
   private reconnectAttempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private retryTimer: ReturnType<typeof setTimeout> | undefined;
 
+  private connecting: Promise<void> | undefined; // the one connect() promise; makes connect() idempotent
   private joinWaiter: Waiter | undefined;
   private readonly pings = new Map<string, Waiter>();
   private readonly outstanding = new Map<bigint, Outstanding>(); // client_seq → un-acked commit
@@ -126,15 +164,26 @@ export class Room {
     this.onStatus = opts.onStatus;
     this.reconnectDelayMs = opts.reconnectDelayMs ?? defaultBackoff;
     this.commitRetryMs = opts.commitRetryMs ?? 5000;
+    this.commitMaxAttempts = opts.commitMaxAttempts ?? 10;
   }
 
-  /** Dial, Join, and resolve on the first Joined. Drops thereafter auto-reconnect (see class docs). */
+  /**
+   * Dial, Join, and resolve on the first Joined. Drops thereafter auto-reconnect (see class docs).
+   *
+   * Idempotent: repeat calls return the SAME promise rather than dialing again. A second dial used
+   * to overwrite `this.transport`, orphaning a fully-wired socket that nobody would ever close — and
+   * when that orphan later dropped, its `onTransportClose` cleared the pointer to the *healthy*
+   * connection, black-holing writes and reporting FROZEN over a live link. It also overwrote
+   * `joinWaiter`, so the first caller's promise could never settle.
+   */
   connect(): Promise<void> {
-    const joined = new Promise<void>((resolve, reject) => {
+    if (this.closedByUser) return Promise.reject(new Error('room closed'));
+    if (this.connecting) return this.connecting;
+    this.connecting = new Promise<void>((resolve, reject) => {
       this.joinWaiter = { resolve, reject };
     });
     void this.openConnection();
-    return joined;
+    return this.connecting;
   }
 
   /** The materialized room state (last-write-wins key/value). Treat as read-only. */
@@ -175,11 +224,16 @@ export class Room {
    * `client_seq`, which together with `client_id` is the server's exactly-once dedup key.
    */
   commit(body: EventBody): Promise<void> {
+    // A closed Room can never re-drive anything: send() is a no-op with no transport and armRetry()
+    // refuses to arm, so parking a waiter here would leave the promise unsettled forever. Reject
+    // before burning a client_seq. Note `closedByUser` is also set by a terminal INVALID Join, so
+    // this covers an app whose connect() failed and which never called close() itself.
+    if (this.closedByUser) return Promise.reject(new Error('room closed'));
     this.clientSeq += 1n;
     const seq = this.clientSeq;
     return new Promise<void>((resolve, reject) => {
-      this.outstanding.set(seq, { body, resolve, reject });
-      this.sendCommit(seq, body);
+      this.outstanding.set(seq, { body, resolve, reject, attempts: 0 });
+      this.sendHead(); // queued behind any earlier un-acked commit — see sendHead
       this.armRetry();
     });
   }
@@ -189,9 +243,21 @@ export class Room {
     this.send({ case: 'broadcast', value: { roomId: this.roomId, body } });
   }
 
-  /** App-level keepalive/RTT probe: resolves when the matching Pong returns. */
+  /**
+   * App-level keepalive/RTT probe: resolves when the matching Pong returns, rejects if the connection
+   * drops first. `id` must be unique among in-flight pings (a duplicate rejects rather than orphaning
+   * the earlier waiter), and there must be a live transport.
+   */
   ping(id: string): Promise<void> {
     return new Promise<void>((resolve, reject) => {
+      if (this.pings.has(id)) {
+        reject(new Error(`ping id ${id} already in flight`));
+        return;
+      }
+      if (!this.transport) {
+        reject(new Error('ping: not connected'));
+        return;
+      }
       this.pings.set(id, { resolve, reject });
       this.send({ case: 'ping', value: { id } });
     });
@@ -203,6 +269,7 @@ export class Room {
     this.clearTimer('reconnectTimer');
     this.clearTimer('retryTimer');
     this.transport?.close();
+    this.dropTransport();
     const err = new Error('room closed');
     this.joinWaiter?.reject(err);
     this.joinWaiter = undefined;
@@ -216,6 +283,11 @@ export class Room {
 
   private async openConnection(): Promise<void> {
     if (this.closedByUser) return;
+    // Defence in depth: never assign over a live transport without closing it. connect() is now
+    // idempotent and the reconnect path is guarded by reconnectTimer, so this should be unreachable —
+    // but an orphaned socket stays wired to our handlers, and its eventual drop would clear the
+    // pointer to the healthy one.
+    this.transport?.close();
     const t = this.dial();
     this.transport = t;
     try {
@@ -225,6 +297,7 @@ export class Room {
       });
       this.sendJoin(this.cursor); // 0 on first connect, cursor on resume
     } catch {
+      this.dropTransport(); // a failed dial must not leave a dead transport behind
       this.scheduleReconnect();
     }
   }
@@ -232,10 +305,22 @@ export class Room {
   private onTransportClose(reason?: Error): void {
     // Pings are transient RTT probes — fail them. Outstanding commits SURVIVE for the resend on
     // reconnect (the whole point of recovery). A user close() is handled in close(), not here.
+    this.dropTransport();
     this.setLive(false);
     rejectAll(this.pings.values(), reason ?? new Error('connection closed'));
     this.pings.clear();
     this.scheduleReconnect();
+  }
+
+  /**
+   * Forget the current transport. Load-bearing for `ping()`, whose liveness check is
+   * `this.transport`: leaving a dead transport in place made a ping issued while disconnected pass
+   * the guard, park a waiter that never settled, and poison that ping id for the Room's lifetime.
+   * Also clears the in-flight marker so the next connection re-sends the head commit.
+   */
+  private dropTransport(): void {
+    this.transport = undefined;
+    this.inFlight = undefined;
   }
 
   private scheduleReconnect(): void {
@@ -278,25 +363,72 @@ export class Room {
       }
       case 'error':
         this.onError?.(m.body.value.code, m.body.value.message);
+        this.onServerError(m.body.value.code, m.body.value.message);
         break;
       default:
         break;
     }
   }
 
+  /**
+   * A server `Error` frame arriving while our Join is still unanswered means the Join FAILED — and
+   * the gateway leaves the socket wide open when it happens (`handleJoin` replies Error and returns
+   * without starting a relay), so no `onClose` fires and nothing else would ever retry. Left alone
+   * the Room sat un-joined forever on a healthy-looking socket, `connect()` never settled, and every
+   * later commit drew `Nack{NOT_JOINED}`.
+   *
+   * The gateway only emits two codes, and they split cleanly:
+   *   UNAVAILABLE — no reachable owner / snapshot fetch failed: transient, so drop this connection
+   *                 and let the reconnect backoff ride out the re-home.
+   *   INVALID     — malformed frame, missing or mismatched session_nonce: retrying cannot help, so
+   *                 fail `connect()` and stop.
+   * An unknown code is treated as transient: retrying is recoverable, giving up is not.
+   */
+  private onServerError(code: string, message: string): void {
+    if (!this.joinPending || this.closedByUser) return;
+    this.joinPending = false;
+
+    if (code === 'INVALID') {
+      this.closedByUser = true; // terminal: stop recovery, this session can never join
+      this.clearTimer('reconnectTimer');
+      this.clearTimer('retryTimer');
+      this.transport?.close();
+      this.dropTransport();
+      const err = new Error(`join rejected: ${code}: ${message}`);
+      this.joinWaiter?.reject(err);
+      this.joinWaiter = undefined;
+      rejectAll(this.pings.values(), err);
+      this.pings.clear();
+      rejectAll(this.outstanding.values(), err);
+      this.outstanding.clear();
+      return;
+    }
+
+    // Transient: tear the connection down so the normal reconnect path retries with backoff.
+    this.transport?.close();
+    this.dropTransport();
+    this.setLive(false);
+    this.scheduleReconnect();
+  }
+
   private onJoined(j: Joined): void {
     this.clientIdValue = j.clientId;
+    this.joinPending = false;
     this.reconnectAttempt = 0; // a successful join resets backoff
     if (j.snapshot) {
       // Fresh join, or a deep resume where our cursor fell below the log's floor: adopt the snapshot
-      // wholesale as the new base.
+      // wholesale as the new base. Copy each value (protobuf-es decodes `bytes` as a view aliasing the
+      // frame buffer) — matching the reducer's `fold`, so snapshot and folded state behave identically.
       this.state = emptyState();
-      for (const [k, v] of Object.entries(j.snapshot.state?.entries ?? {})) this.state.set(k, v);
+      for (const [k, v] of Object.entries(j.snapshot.state?.entries ?? {}))
+        this.state.set(k, v.slice());
+      // The cursor is exactly the snapshot's materialized point. We deliberately do NOT advance it to
+      // j.current_seq: current_seq can be the log head, ahead of the snapshot, and the relay streams
+      // the events between them — jumping the cursor there would silently drop that backfill.
       this.cursor = j.snapshot.roomSeq;
     }
     // No snapshot ⇒ a resume from our cursor: keep the state we already have; the gateway streams the
     // events after `cursor` to backfill.
-    if (j.currentSeq > this.cursor) this.cursor = j.currentSeq;
     this.setLive(true);
     this.bump();
     this.joinWaiter?.resolve(); // resolves the first connect(); a no-op on later reconnects
@@ -306,8 +438,11 @@ export class Room {
 
   private onEvent(e: Event): void {
     if (e.roomId !== this.roomId) return;
-    // Fan-out is the ack: our own committed event returning resolves the outstanding commit — whether
-    // a live delivery or a replay during recovery (so an already-applied commit still acks).
+    // Fan-out is the ack: our own committed event returning resolves the outstanding commit. This runs
+    // BEFORE the replay/gap gates below on purpose — the ack signals DURABILITY (the commit is in the
+    // log), not local materialization. So an already-applied commit replayed during recovery still
+    // acks even though its room_seq ≤ cursor, and a deep-resume that re-fans a subsumed commit resolves
+    // it too. Local state may briefly lag the ack in a gap; the cursor-resume backfill reconciles it.
     if (e.originClientId === this.clientIdValue) this.ackCommit(e.originClientSeq);
 
     const expected = this.cursor + 1n;
@@ -327,12 +462,22 @@ export class Room {
     if (n.roomId !== this.roomId) return;
     const o = this.outstanding.get(n.clientSeq);
     if (!o) return;
-    // UNAVAILABLE = no reachable owner / re-homing: transient. Keep it buffered so the retry timer /
-    // reconnect re-sends it. Every other reason is terminal → reject.
-    if (n.reason === NackReason.UNAVAILABLE) return;
+    if (this.inFlight === n.clientSeq) this.inFlight = undefined;
+    // Both reasons the gateway can actually produce are TRANSIENT, so both stay buffered for the
+    // retry timer / reconnect to re-drive:
+    //   UNAVAILABLE — no reachable owner, i.e. mid-re-home.
+    //   NOT_JOINED  — this connection has no relay for the room yet (its Join failed or is still in
+    //                 flight). Rejecting here turned a failover the design is built to survive into
+    //                 a permanent write failure for a commit the server never refused on the merits.
+    // Every other reason is a real refusal → terminal.
+    if (n.reason === NackReason.UNAVAILABLE || n.reason === NackReason.NOT_JOINED) {
+      this.armRetry();
+      return;
+    }
     this.outstanding.delete(n.clientSeq);
     this.stopRetryIfDrained();
     o.reject(new NackError(n.reason));
+    this.sendHead();
   }
 
   private onRoomStatus(rs: RoomStatus): void {
@@ -347,13 +492,49 @@ export class Room {
     const o = this.outstanding.get(clientSeq);
     if (o) {
       this.outstanding.delete(clientSeq);
+      if (this.inFlight === clientSeq) this.inFlight = undefined;
       this.stopRetryIfDrained();
       o.resolve();
+      this.sendHead(); // the next queued commit may now go out
     }
   }
 
+  /**
+   * Send the lowest un-acked commit — and only that one.
+   *
+   * Strict one-at-a-time is load-bearing, not throttling. The owner dedups on a per-client
+   * HIGH-WATER mark, so once client_seq N is applied every seq < N becomes permanently unappliable.
+   * Letting N+1 reach a new owner while N is still buffered (say N drew a transient UNAVAILABLE
+   * mid-re-home) burns a hole: N's resends are then silently swallowed as duplicates, no Event ever
+   * fans back, and N's data never reaches the log — a lost write under an exactly-once contract.
+   * Keeping exactly one commit on the wire makes that hole unconstructible, and mirrors the
+   * one-op-in-flight-per-client contract the Go DST already models.
+   */
+  private sendHead(): void {
+    if (this.inFlight !== undefined) return;
+    const head = this.outstanding.entries().next();
+    if (head.done) return;
+    const [seq, o] = head.value;
+
+    // A commit the owner has already deduped can never be acked by fan-out (see
+    // CommitUnconfirmedError). Give up loudly rather than resending forever.
+    if (this.commitMaxAttempts > 0 && o.attempts >= this.commitMaxAttempts) {
+      this.outstanding.delete(seq);
+      o.reject(new CommitUnconfirmedError(seq));
+      this.stopRetryIfDrained();
+      this.sendHead(); // unblock whatever queued behind it
+      return;
+    }
+
+    o.attempts += 1;
+    this.inFlight = seq;
+    this.sendCommit(seq, o.body);
+  }
+
+  /** Re-drive the head commit (recovery / retry timer): drop the in-flight marker, then re-send. */
   private resendOutstanding(): void {
-    for (const [seq, o] of this.outstanding) this.sendCommit(seq, o.body);
+    this.inFlight = undefined;
+    this.sendHead();
   }
 
   // ===== commit retry timer (in-place, drop-less recovery) =====
@@ -383,6 +564,7 @@ export class Room {
   }
 
   private sendJoin(fromSeq: bigint): void {
+    this.joinPending = true;
     this.send({ case: 'join', value: { roomId: this.roomId, fromSeq, sessionNonce: this.nonce } });
   }
 
