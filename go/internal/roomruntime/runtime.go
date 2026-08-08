@@ -71,6 +71,14 @@ type Runtime struct {
 	// happens outside the lock (see Commit) so subscribers can't stall or deadlock it.
 	mu    sync.Mutex
 	rooms map[string]*roomcore.Room
+
+	// owned is the set of rooms whose lease this node currently holds. It is NOT the same as
+	// rooms: a conflicted append drops the in-memory room while the lease may still be held, so
+	// tracking ownership separately is what lets Shutdown release everything it actually owns.
+	owned map[string]struct{}
+	// closed is set by Shutdown. It makes acquire refuse, which is load-bearing: acquire CLAIMS,
+	// so without it any request still in flight would instantly re-take a room we just released.
+	closed bool
 }
 
 // Option configures a Runtime. Unset options fall back to single-node defaults: a private
@@ -131,6 +139,7 @@ func New(log logstore.LogStore, fo fanout.Fanout, opts ...Option) *Runtime {
 		ttl:      defaultLeaseTTL,
 		tailPoll: defaultTailPollInterval,
 		rooms:    map[string]*roomcore.Room{},
+		owned:    map[string]struct{}{},
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -226,8 +235,45 @@ func (r *Runtime) Join(ctx context.Context, roomID string) (*aetherv1.Joined, er
 func (r *Runtime) Release(roomID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.releaseLocked(roomID)
+}
+
+// Shutdown relinquishes EVERY room this node owns and permanently stops it taking on more. It is
+// the planned-departure path — SIGTERM on a rolling deploy, a scale-down, a drained node — and it
+// is what turns "up to one lease TTL of unroutable rooms" into "a survivor can claim immediately".
+// That matters because the TTL, not the placement decision, dominates re-ownership latency: the
+// directory keeps naming a departed owner until its lease lapses.
+//
+// Order is load-bearing. `closed` is set BEFORE releasing, because acquire claims: a Commit or
+// Join arriving between the release and process exit would otherwise re-take the very room we just
+// handed over, and the survivor would lose it again. Once closed, acquire returns ErrNotOwner —
+// which is not a white lie but the literal truth after the release, and every caller already
+// handles it by re-resolving the owner.
+//
+// Idempotent. Safe to call with rooms still materialized; they are dropped.
+//
+// SCOPE: this releases leases. It does NOT tear down in-flight Tail/Subscribe streams — those end
+// when the RPC server's context is cancelled (http.Server.Shutdown), which is the binary's job and
+// lands with cmd/. A gateway whose stream outlives the release keeps reading an owner that no
+// longer owns the room until the stream dies, so the two must be sequenced together at the call
+// site: stop the RPC server, then Shutdown the runtime.
+func (r *Runtime) Shutdown() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.closed = true
+	for roomID := range r.owned {
+		r.releaseLocked(roomID)
+	}
+}
+
+// releaseLocked gives up one room's lease and drops its in-memory state. Caller must hold r.mu.
+// coord.Release is a no-op unless this node is the current holder, so releasing a room whose lease
+// we already lost cannot revoke the new owner's claim.
+func (r *Runtime) releaseLocked(roomID string) {
 	r.coord.Release(roomID, r.nodeID)
 	delete(r.rooms, roomID)
+	delete(r.owned, roomID)
 }
 
 // acquire confirms this node holds the room's ownership lease, claiming it if the room is free
@@ -241,10 +287,17 @@ func (r *Runtime) Release(roomID string) {
 // overwrite), so a zombie owner can't clobber a fresher snapshot with a stale one. We thread
 // the token into snapshot writes when snapshots are added.
 func (r *Runtime) acquire(roomID string) error {
-	if _, ok := r.coord.Claim(roomID, r.nodeID, r.addr, r.now(), r.ttl); !ok {
-		delete(r.rooms, roomID) // we no longer own it; don't serve from a stale copy
+	// A shut-down node must never re-claim. Shutdown released these rooms so a survivor could take
+	// them immediately; claiming again here would snatch one straight back.
+	if r.closed {
 		return ErrNotOwner
 	}
+	if _, ok := r.coord.Claim(roomID, r.nodeID, r.addr, r.now(), r.ttl); !ok {
+		delete(r.rooms, roomID) // we no longer own it; don't serve from a stale copy
+		delete(r.owned, roomID)
+		return ErrNotOwner
+	}
+	r.owned[roomID] = struct{}{}
 	return nil
 }
 
