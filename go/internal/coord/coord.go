@@ -55,10 +55,17 @@ type Lease struct {
 // Convoyed behind one mutex it cannot. The timeout belongs to the implementation; the requirement
 // belongs here, where the interface is set.
 //
-// 2. HONOUR ctx. A cancelled context must produce an error, never a silent success. Memory ignores
-// ctx because an in-memory map cannot block, which leaves the suite blind to callers that pass an
-// already-dead context — see coordtest.Faulty, which reads ctx precisely so that such misuse fails
-// loudly in tests instead of as a stranded lease in production.
+// 2. HONOUR ctx. A cancelled context must produce an error, never a silent success. Memory checks
+// ctx for this reason even though an in-memory map cannot block: a cancelled context means the
+// caller has given up however fast the answer would have been, and a fake that ignored it would
+// leave the suite blind to callers passing an already-dead context.
+//
+// 3. Lease.Expiry IS THE CALLER'S CLOCK plus the requested ttl — never a server-side timestamp.
+// Callers compare it against their own now to decide whether they still hold a room, so an expiry
+// minted from the store's clock would skew that comparison by the full inter-node offset. Computing
+// it server-side is the more natural thing to write in a DynamoDB adapter, and Memory's now.Add(ttl)
+// makes the coupling invisible until then, which is why it is stated rather than left to be
+// inferred.
 type Coordinator interface {
 	// Claim attempts to acquire roomID for owner, publishing owner's dialable RPC address (addr)
 	// atomically with the claim — so the directory never names an owner the gateway can't reach
