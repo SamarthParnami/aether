@@ -51,12 +51,26 @@ type View struct {
 // registration; dropping it here as well means a malformed row in the store cannot reintroduce
 // the hazard behind their back.
 //
-// On duplicate IDs the first entry in the INPUT wins. The sort must therefore be stable: an
-// unstable sort is free to reorder the equal-ID pair, which would make the surviving Addr
-// unspecified — and two gateways handed the same nodes in a different order (a DynamoDB scan
-// guarantees no order across pages) would then dial different addresses for one node id. That is
-// placement divergence, the same failure mode the maphash ban exists to prevent, and it is
-// invisible below the sort's insertion-sort size cutoff where equal elements never move.
+// On duplicate IDs the LOWEST Addr wins, and the ordering is total over (ID, Addr).
+//
+// Ordering by ID alone is not enough, and a stable sort does not rescue it. Stability makes the
+// survivor a function of the INPUT SEQUENCE; what placement requires is a function of the node
+// SET. Those differ in exactly the scenario this defends against — a DynamoDB Scan guarantees no
+// order across pages, so two gateways reading one table receive the same rows in different orders,
+// and a stable sort faithfully preserves each gateway's own order. Same set, two page orders:
+//
+//	gateway A dials node-7 at 10.0.0.8:7001
+//	gateway B dials node-7 at 10.9.9.9:7001
+//
+// Both gateways agree on the node set and still route to different processes, because placement
+// dials Node.Addr, not Node.ID. Breaking the tie on Addr removes input order from the answer
+// entirely — which also makes stability irrelevant, so the plain SortFunc is used.
+//
+// Lowest-Addr is DETERMINISTIC BUT ARBITRARY: the row actually wanted is the newest registration
+// (a pod that re-registered on a new address), and dedup keyed on ID alone cannot express that —
+// nothing here knows which row is current. The real fix belongs in the durable layer: a
+// registration epoch on Node with newest-wins, or a store keyed by node id so duplicates cannot
+// arise. Determinism is the floor, not the ceiling.
 func NewView(nodes []Node) View {
 	routable := make([]Node, 0, len(nodes))
 	for _, n := range nodes {
@@ -65,7 +79,12 @@ func NewView(nodes []Node) View {
 		}
 		routable = append(routable, n)
 	}
-	slices.SortStableFunc(routable, func(a, b Node) int { return strings.Compare(a.ID, b.ID) })
+	slices.SortFunc(routable, func(a, b Node) int {
+		if c := strings.Compare(a.ID, b.ID); c != 0 {
+			return c
+		}
+		return strings.Compare(a.Addr, b.Addr)
+	})
 	return View{nodes: slices.CompactFunc(routable, func(a, b Node) bool { return a.ID == b.ID })}
 }
 
