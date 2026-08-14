@@ -72,8 +72,14 @@ func (r *Runtime) Tail(
 	// construct &time.Ticker{C: ch}, i.e. outside NewTicker, and on go1.26 that accepts Stop but
 	// PANICS on Reset ("time: Reset called on uninitialized Ticker") — which this loop calls on
 	// every fan-out wake, just below. So such a fake survives construction and teardown and then
-	// dies on the first commit into the room: broken on every active room, fine on every quiet one,
-	// which is worse than having no seam. Pass a channel plus a stop func instead.
+	// dies on the first commit into the room, which is worse than having no seam. Pass a channel
+	// plus a stop func instead.
+	//
+	// Note how narrow the failing case is, because it is what makes it hard to attribute: the wake
+	// comes from THIS node's fan-out, so the panic needs a room committed to HERE. A room being read
+	// here while it is written on another node never wakes, never calls Reset, and never fails — so
+	// a re-homed room would survive such a fake entirely, and it would only surface once writes came
+	// home.
 	ticker := time.NewTicker(r.tailPoll)
 	defer ticker.Stop()
 
