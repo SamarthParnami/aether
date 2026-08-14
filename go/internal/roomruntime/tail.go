@@ -98,12 +98,13 @@ func (r *Runtime) Tail(
 			// The renewal is BEST-EFFORT and never fatal to the stream. Every failure mode is a
 			// reason to keep serving, not to stop:
 			//
-			//   - ErrNotOwner: 01-design-backbone §4.2 specifies that a placement loser's watchers
-			//     keep reading correctly from the shared log and converge on the winner's commits
-			//     within one tick, and TestTailPollSurvivesReHome pins it. (07-design-placement.md
-			//     §10 wants the opposite — a per-tick check that stops a loser serving a lagging
-			//     read path — but it contradicts §4.2, is listed there as owed and NOT scheduled,
-			//     and reversing a documented tested guarantee is not a side effect to take on.)
+			//   - ErrNotOwner: a placement loser's watchers keep reading CORRECTLY, because Tail
+			//     reads events from the shared log and never from fan-out, so the loser converges
+			//     on the winner's commits within one poll tick. TestTailPollSurvivesReHome pins
+			//     exactly that. (There is an argument for the opposite — a per-tick ownership check
+			//     that stops a loser serving a lagging read path — but it would reverse a tested
+			//     guarantee, so it wants deciding on its own, not as a side effect of a capacity
+			//     fix. See Runtime.Shutdown, where the same tension is recorded.)
 			//   - ErrCoordUnavailable: not knowing whether we still hold the lease is not evidence
 			//     that we do not, exactly as acquire itself refuses to render an unanswered claim as
 			//     ErrNotOwner. Returning here would let a store blip shorter than one poll interval

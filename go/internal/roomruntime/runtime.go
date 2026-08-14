@@ -36,7 +36,13 @@ import (
 )
 
 // defaultLeaseTTL is the lease lifetime used when WithLeaseTTL is not supplied. It must be
-// comfortably larger than the (later) renewal interval and the max inter-node clock skew.
+// comfortably larger than the renewal interval (defaultTailPollInterval, which is what renews a
+// read-held room) and the max inter-node clock skew.
+//
+// 01-design-backbone.md §6.4 specifies "renew ~2s, expire ~6s". These are 3s/10s: the same
+// renew-to-expiry ratio, shifted up, which buys more headroom against GC pauses and skew at the
+// cost of a slower failover floor. Noted because §6.4's numbers are the ones a reader will check
+// this constraint against and they will not match.
 const defaultLeaseTTL = 10 * time.Second
 
 // defaultTailPollInterval is the coarse backstop at which Tail re-reads the durable log even with
@@ -342,8 +348,9 @@ func (r *Runtime) Release(ctx context.Context, roomID string) error {
 // UNRESOLVED, and P9 must settle it rather than inherit it. The note here used to say the two are
 // sequenced "stop the RPC server, then Shutdown the runtime", on the grounds that a stream
 // outliving the release keeps reading from a node that no longer owns the room. That justification
-// now contradicts the one Tail's renewal relies on: §4.2 explicitly permits a reader to outlive the
-// release, because reads come from the shared log and stay correct. Both orderings have a cost:
+// now contradicts the one Tail's renewal relies on: a reader may outlive the release and stay
+// correct, because reads come from the shared log rather than from ownership
+// (TestTailPollSurvivesReHome). Both orderings have a cost:
 //
 //   - server first: leases are still held when the server stops, so every disconnected gateway
 //     re-resolves onto a directory still naming this pod, dials a dead address and backs off until
