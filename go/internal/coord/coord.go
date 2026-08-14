@@ -42,6 +42,23 @@ type Lease struct {
 // reads "unowned" as an invitation to place the room somewhere. That would aim a claim storm at a
 // store already failing. Callers check err FIRST and freeze on ambiguity; only a nil error makes
 // the bool meaningful (01-design-backbone.md:240).
+//
+// # Two requirements on any durable implementation
+//
+// 1. BOUND EVERY CALL, well under the lease TTL. Not a suggestion: roomruntime.acquire calls Claim
+// as the first thing inside the Runtime-wide mutex, on the Join, Commit, Tail, TailEphemeral and
+// Broadcast paths. That lock is a documented Phase-1 simplification accepted for logstore.Append,
+// which fails fast and is conditional per room — a coord brownout is the opposite: slow, node-wide,
+// and correlated across every room at once. An unbounded retry budget inside that lock converts a
+// store brownout into a full node stall, and this layer's whole thesis is that ambiguity should
+// freeze rather than storm — which assumes the node can still answer in order to say "frozen".
+// Convoyed behind one mutex it cannot. The timeout belongs to the implementation; the requirement
+// belongs here, where the interface is set.
+//
+// 2. HONOUR ctx. A cancelled context must produce an error, never a silent success. Memory ignores
+// ctx because an in-memory map cannot block, which leaves the suite blind to callers that pass an
+// already-dead context — see coordtest.Faulty, which reads ctx precisely so that such misuse fails
+// loudly in tests instead of as a stranded lease in production.
 type Coordinator interface {
 	// Claim attempts to acquire roomID for owner, publishing owner's dialable RPC address (addr)
 	// atomically with the claim — so the directory never names an owner the gateway can't reach
@@ -55,6 +72,12 @@ type Coordinator interface {
 
 	// Renew extends owner's lease. Returns false (ownership lost) if owner is not the
 	// current unexpired holder.
+	//
+	// RESERVED — it has no production call site and is not expected to gain one. Ownership is
+	// renewed by claim-on-serve (Claim is idempotent for the current holder and re-affirms addr),
+	// so a reader should not assume a renew path exists. It is kept for a future background
+	// renewal loop that pins quiet rooms; such a loop would still re-Claim if it needs to update
+	// addr (see Memory.Renew).
 	Renew(ctx context.Context, roomID, owner string, now time.Time, ttl time.Duration) (Lease, bool, error)
 
 	// Release relinquishes ownership if owner holds it — a graceful handoff on shutdown,

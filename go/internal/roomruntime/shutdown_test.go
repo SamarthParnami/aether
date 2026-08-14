@@ -12,9 +12,15 @@ import (
 // shutdown asserts the graceful path actually completed. Shutdown now reports the releases it
 // could not land, and a test that discarded that would keep passing while every lease leaked —
 // the exact failure Shutdown exists to prevent.
+//
+// Deliberately context.Background() and NOT t.Context(): t.Context() is cancelled just before
+// Cleanup functions run, and this helper is exactly the shape one registers in t.Cleanup. Against a
+// ctx-aware coordinator that combination makes every release fail — a silent no-op that still
+// passes, since the rooms are dropped locally either way. The production trap is the same shape
+// (see Runtime.Shutdown).
 func shutdown(t *testing.T, rt *roomruntime.Runtime) {
 	t.Helper()
-	if err := rt.Shutdown(t.Context()); err != nil {
+	if err := rt.Shutdown(context.Background()); err != nil {
 		t.Fatalf("Shutdown: %v", err)
 	}
 }

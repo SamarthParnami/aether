@@ -264,6 +264,16 @@ func (r *Runtime) Release(ctx context.Context, roomID string) error {
 // site: stop the RPC server, then Shutdown the runtime.
 // Every room is attempted even if one release fails; the failures are joined and returned, so a
 // single unreachable-store room cannot strand the rest of the node's leases.
+//
+// PASS A FRESH, BOUNDED CONTEXT — never the signal context. The canonical wiring is a trap:
+//
+//	ctx, _ := signal.NotifyContext(context.Background(), syscall.SIGTERM)
+//	<-ctx.Done()      // ctx is now CANCELLED
+//	rt.Shutdown(ctx)  // every coord.Release fails; every lease strands for a full TTL
+//
+// That is this method's entire reason for existing, undone on every rolling deploy — and the rooms
+// are already dropped locally by the time the error comes back, so there is nothing left to retry
+// with. Use context.WithTimeout(context.Background(), …) sized under the lease TTL instead.
 func (r *Runtime) Shutdown(ctx context.Context) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
