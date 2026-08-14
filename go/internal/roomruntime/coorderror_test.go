@@ -145,6 +145,39 @@ func TestShutdownReportsFailedReleases(t *testing.T) {
 	}
 }
 
+// Pins the trap in Shutdown's doc, because no amount of documentation stops the canonical wiring:
+//
+//	ctx, _ := signal.NotifyContext(ctx, syscall.SIGTERM); <-ctx.Done(); rt.Shutdown(ctx)
+//
+// Against coord.Memory this looks perfect — it ignores ctx entirely, so every release "succeeds"
+// and the handover appears instant. Against anything that honours ctx (every durable store) each
+// release fails, the rooms are dropped locally anyway, and every lease strands for a full TTL.
+// That is #49's whole guarantee gone, silently, on every rolling deploy.
+//
+// The test exists because the failure is invisible to the rest of the suite: it takes a coordinator
+// that reads ctx, which is exactly what coordtest.Faulty now provides.
+func TestShutdownWithACancelledContextStrandsEveryLease(t *testing.T) {
+	rt, _, _ := oneNode(t)
+	rooms := []string{"room-1", "room-2"}
+	for _, room := range rooms {
+		if _, applied, err := rt.Commit(context.Background(), room, "x", 1, kvBody("k", "v")); err != nil || !applied {
+			t.Fatalf("%s commit: applied=%v err=%v", room, applied, err)
+		}
+	}
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := rt.Shutdown(cancelled)
+	if err == nil {
+		t.Fatal("Shutdown reported success with a cancelled context — the caller has no way to " +
+			"learn that every lease was stranded")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Shutdown err = %v, want it to wrap context.Canceled", err)
+	}
+}
+
 // perRoomFaultyRelease fails Release for chosen rooms and records every room it was asked to
 // release — enough to tell "never attempted" apart from "attempted and failed", which is the whole
 // question when one room's failure could abort the loop.
