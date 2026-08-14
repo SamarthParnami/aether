@@ -41,7 +41,12 @@ type Lease struct {
 // timeout rendered as "not held" is indistinguishable from "this room is unowned", and routing
 // reads "unowned" as an invitation to place the room somewhere. That would aim a claim storm at a
 // store already failing. Callers check err FIRST and freeze on ambiguity; only a nil error makes
-// the bool meaningful (01-design-backbone.md:240).
+// the bool meaningful.
+//
+// The principle is 01-design-backbone.md §6.4's lease fail-safe — "ambiguity → freeze, never assume
+// ownership" — though note §6.4 scopes it to refusing WRITES. Extending it to routing (an
+// unanswered directory read must not be rendered as "unowned", because that reads as permission to
+// place) is this layer's own conclusion, not something §6.4 states.
 //
 // # Two requirements on any durable implementation
 //
@@ -60,12 +65,18 @@ type Lease struct {
 // caller has given up however fast the answer would have been, and a fake that ignored it would
 // leave the suite blind to callers passing an already-dead context.
 //
-// 3. Lease.Expiry IS THE CALLER'S CLOCK plus the requested ttl — never a server-side timestamp.
-// Callers compare it against their own now to decide whether they still hold a room, so an expiry
-// minted from the store's clock would skew that comparison by the full inter-node offset. Computing
-// it server-side is the more natural thing to write in a DynamoDB adapter, and Memory's now.Add(ttl)
-// makes the coupling invisible until then, which is why it is stated rather than left to be
-// inferred.
+// 3. The Expiry that CLAIM AND RENEW return is the caller's clock plus the requested ttl — never a
+// server-side timestamp. A claimant compares it against its own now to decide whether it still
+// holds a room, so an expiry minted from the store's clock would skew that comparison by the full
+// inter-node offset. Computing it server-side is the more natural thing to write in a DynamoDB
+// adapter, and Memory's now.Add(ttl) makes the coupling invisible until then.
+//
+// CURRENT is different, and the distinction matters: it returns the STORED lease, whose Expiry was
+// minted by whichever node claimed the room, from that node's clock. It is not comparable against
+// the reader's clock beyond the liveness check Current has already applied — "how long until this
+// lease lapses" is a natural question for a gateway to ask and is only answerable to within the
+// full inter-node skew. That is safe as a liveness test (see the package doc: skew widens the
+// failover window, it does not break the hard guard) and unsafe as arithmetic.
 type Coordinator interface {
 	// Claim attempts to acquire roomID for owner, publishing owner's dialable RPC address (addr)
 	// atomically with the claim — so the directory never names an owner the gateway can't reach

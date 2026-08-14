@@ -30,8 +30,8 @@ var ErrNoOwner = errors.New("gateway: no reachable owner for room")
 // this PR is a no-op at runtime. It exists because the placement work is about to make the
 // difference load-bearing: a resolve that cannot read the directory must NOT fall through to
 // choosing a node by hash, or a coord brownout becomes a fleet-wide claim storm aimed at the store
-// that is already failing (07-design-placement.md §4.1). Ambiguity freezes; only a definite
-// ErrNoOwner may ever authorize placement.
+// that is already failing. Ambiguity freezes; only a definite ErrNoOwner may ever authorize
+// placement.
 var ErrDirectoryUnavailable = errors.New("gateway: room directory unavailable")
 
 // OwnerLocator resolves a room to its current owner's RoomService client via the coord directory,
