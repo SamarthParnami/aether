@@ -335,7 +335,7 @@ func TestMaxRoomsCountsRoomsHeldByReadersAlone(t *testing.T) {
 // delivered event, which means the initial acquire has already succeeded. Without that barrier the
 // goroutine can race the test's own state changes and take the admission gate on its FIRST acquire,
 // which proves nothing about established streams.
-func startReader(t *testing.T, ctx context.Context, rt *roomruntime.Runtime, room string) <-chan error {
+func startReader(ctx context.Context, t *testing.T, rt *roomruntime.Runtime, room string) <-chan error {
 	t.Helper()
 	done := make(chan error, 1)
 	first := make(chan struct{})
@@ -381,7 +381,7 @@ func TestCoordBrownoutDoesNotDisconnectEstablishedReaders(t *testing.T) {
 
 	readers := make([]<-chan error, 8)
 	for i := range readers {
-		readers[i] = startReader(t, ctx, rt, "room")
+		readers[i] = startReader(ctx, t, rt, "room")
 	}
 
 	co.FailClaim(errors.New("dynamodb: throttled")) // a blip spanning several poll ticks
@@ -413,7 +413,7 @@ func TestDrainDoesNotCutEstablishedReaders(t *testing.T) {
 	if _, applied, err := rt.Commit(ctx, "room", "x", 1, kvBody("k", "v")); err != nil || !applied {
 		t.Fatalf("seed commit: applied=%v err=%v", applied, err)
 	}
-	done := startReader(t, ctx, rt, "room")
+	done := startReader(ctx, t, rt, "room")
 
 	// The documented preStop sequence, which drops the room from owned.
 	rt.SetDraining(true)
