@@ -51,7 +51,12 @@ type View struct {
 // registration; dropping it here as well means a malformed row in the store cannot reintroduce
 // the hazard behind their back.
 //
-// On duplicate IDs the first entry in ID order wins.
+// On duplicate IDs the first entry in the INPUT wins. The sort must therefore be stable: an
+// unstable sort is free to reorder the equal-ID pair, which would make the surviving Addr
+// unspecified — and two gateways handed the same nodes in a different order (a DynamoDB scan
+// guarantees no order across pages) would then dial different addresses for one node id. That is
+// placement divergence, the same failure mode the maphash ban exists to prevent, and it is
+// invisible below the sort's insertion-sort size cutoff where equal elements never move.
 func NewView(nodes []Node) View {
 	routable := make([]Node, 0, len(nodes))
 	for _, n := range nodes {
@@ -60,7 +65,7 @@ func NewView(nodes []Node) View {
 		}
 		routable = append(routable, n)
 	}
-	slices.SortFunc(routable, func(a, b Node) int { return strings.Compare(a.ID, b.ID) })
+	slices.SortStableFunc(routable, func(a, b Node) int { return strings.Compare(a.ID, b.ID) })
 	return View{nodes: slices.CompactFunc(routable, func(a, b Node) bool { return a.ID == b.ID })}
 }
 
