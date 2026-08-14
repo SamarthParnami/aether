@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
 	aetherv1 "github.com/SamarthParnami/aether/go/gen/aether/v1"
 	"github.com/SamarthParnami/aether/go/internal/coord"
+	"github.com/SamarthParnami/aether/go/internal/coord/coordtest"
 	"github.com/SamarthParnami/aether/go/internal/fanout"
 	"github.com/SamarthParnami/aether/go/internal/logstore"
 	"github.com/SamarthParnami/aether/go/internal/roomruntime"
@@ -326,5 +328,103 @@ func TestMaxRoomsCountsRoomsHeldByReadersAlone(t *testing.T) {
 	if _, _, err := rt.Commit(ctx, "room-3", "x", 1, kvBody("k", "v")); !errors.Is(err, roomruntime.ErrAtCapacity) {
 		t.Fatalf("third room while two are held by readers = %v, want ErrAtCapacity — the cap "+
 			"cannot see rooms this node is streaming, so it does not bound what the node holds", err)
+	}
+}
+
+// startReader begins a Tail and returns only once the stream is ESTABLISHED — i.e. after its first
+// delivered event, which means the initial acquire has already succeeded. Without that barrier the
+// goroutine can race the test's own state changes and take the admission gate on its FIRST acquire,
+// which proves nothing about established streams.
+func startReader(t *testing.T, ctx context.Context, rt *roomruntime.Runtime, room string) <-chan error {
+	t.Helper()
+	done := make(chan error, 1)
+	first := make(chan struct{})
+	var once sync.Once
+	go func() {
+		done <- rt.Tail(ctx, room, 0, func(*aetherv1.Event) error {
+			once.Do(func() { close(first) })
+			return nil
+		})
+	}()
+	select {
+	case <-first:
+	case err := <-done:
+		t.Fatalf("reader ended before it was established: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("reader never established")
+	}
+	return done
+}
+
+// A transient coord brownout must not disconnect readers that are already streaming.
+//
+// Renewing on Tail's tick put every established stream on the node behind the same store within the
+// same interval, so a blip shorter than one poll interval could drop all of them at once. That
+// inverts the thesis this layer is built on: ambiguity freezes, it does not disconnect. Not knowing
+// whether we still hold the lease is not evidence that we do not — the same reason acquire refuses
+// to render an unanswered claim as ErrNotOwner — and reads come from the shared log, so they stay
+// correct while ownership is unknown.
+func TestCoordBrownoutDoesNotDisconnectEstablishedReaders(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	co := coordtest.New(coord.NewMemory())
+	rt := roomruntime.New(logstore.NewMemory(), fanout.NewMemory(),
+		roomruntime.WithNodeID("A"),
+		roomruntime.WithCoordinator(co),
+		roomruntime.WithLeaseTTL(200*time.Millisecond),
+		roomruntime.WithTailPollInterval(20*time.Millisecond),
+	)
+	if _, applied, err := rt.Commit(ctx, "room", "x", 1, kvBody("k", "v")); err != nil || !applied {
+		t.Fatalf("seed commit: applied=%v err=%v", applied, err)
+	}
+
+	readers := make([]<-chan error, 8)
+	for i := range readers {
+		readers[i] = startReader(t, ctx, rt, "room")
+	}
+
+	co.FailClaim(errors.New("dynamodb: throttled")) // a blip spanning several poll ticks
+	time.Sleep(120 * time.Millisecond)
+	co.FailClaim(nil)
+	time.Sleep(60 * time.Millisecond)
+
+	for i, done := range readers {
+		select {
+		case err := <-done:
+			t.Fatalf("reader %d was disconnected by a transient coord brownout: %v", i, err)
+		default: // still streaming, which is the point
+		}
+	}
+}
+
+// preStop must not cut readers that are mid-stream. This is the promise gating admission-only was
+// made to keep — a drain migrates sessions, it does not drop them — and routing Tail's renewal
+// through those same gates would break it one poll interval after SetDraining.
+func TestDrainDoesNotCutEstablishedReaders(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rt := roomruntime.New(logstore.NewMemory(), fanout.NewMemory(),
+		roomruntime.WithNodeID("A"),
+		roomruntime.WithLeaseTTL(200*time.Millisecond),
+		roomruntime.WithTailPollInterval(20*time.Millisecond),
+	)
+	if _, applied, err := rt.Commit(ctx, "room", "x", 1, kvBody("k", "v")); err != nil || !applied {
+		t.Fatalf("seed commit: applied=%v err=%v", applied, err)
+	}
+	done := startReader(t, ctx, rt, "room")
+
+	// The documented preStop sequence, which drops the room from owned.
+	rt.SetDraining(true)
+	if err := rt.Release(ctx, "room"); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	time.Sleep(80 * time.Millisecond) // several poll ticks
+
+	select {
+	case err := <-done:
+		t.Fatalf("preStop cut a live reader session: %v", err)
+	default:
 	}
 }

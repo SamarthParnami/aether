@@ -2,7 +2,6 @@ package roomruntime
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	aetherv1 "github.com/SamarthParnami/aether/go/gen/aether/v1"
@@ -96,20 +95,28 @@ func (r *Runtime) Tail(
 			// IS the poll interval, so a poll longer than the TTL lets an actively-read room lapse
 			// between ticks and be re-admitted through the capacity gate.
 			//
-			// ErrNotOwner is deliberately IGNORED rather than returned. 01-design-backbone/§4.2
-			// specifies that a placement loser's watchers keep reading correctly from the shared
-			// log and converge on the winner's commits within one tick, and
-			// TestTailPollSurvivesReHome pins exactly that. Returning here would reverse it.
-			// 07-design-placement.md §10 does want a per-tick ownership check that stops a loser
-			// serving a lagging read path — but that contradicts §4.2, it is listed there as owed
-			// and NOT scheduled, and reversing a documented, tested read guarantee is not something
-			// to do as a side effect of a capacity fix.
+			// The renewal is BEST-EFFORT and never fatal to the stream. Every failure mode is a
+			// reason to keep serving, not to stop:
+			//
+			//   - ErrNotOwner: 01-design-backbone §4.2 specifies that a placement loser's watchers
+			//     keep reading correctly from the shared log and converge on the winner's commits
+			//     within one tick, and TestTailPollSurvivesReHome pins it. (07-design-placement.md
+			//     §10 wants the opposite — a per-tick check that stops a loser serving a lagging
+			//     read path — but it contradicts §4.2, is listed there as owed and NOT scheduled,
+			//     and reversing a documented tested guarantee is not a side effect to take on.)
+			//   - ErrCoordUnavailable: not knowing whether we still hold the lease is not evidence
+			//     that we do not, exactly as acquire itself refuses to render an unanswered claim as
+			//     ErrNotOwner. Returning here would let a store blip shorter than one poll interval
+			//     disconnect every reader on the node at once — ambiguity must freeze, not drop.
+			//   - ErrDraining / ErrAtCapacity: these gate ADMISSION. Letting them reach an
+			//     established stream is precisely the "cut every live session the instant preStop
+			//     fired" that gating admission-only exists to prevent.
+			//
+			// So the tick renews when it can and is silent when it cannot. Reads stay correct
+			// regardless, because they come from the shared log rather than from ownership.
 			r.mu.Lock()
-			err := r.acquire(ctx, roomID)
+			_ = r.acquire(ctx, roomID)
 			r.mu.Unlock()
-			if err != nil && !errors.Is(err, ErrNotOwner) {
-				return err
-			}
 		}
 	}
 }
