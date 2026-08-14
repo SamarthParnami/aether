@@ -34,6 +34,10 @@ func NewMemory() *Memory {
 // Heartbeat implements Registry. A node that heartbeats after deregistering is live again: the
 // registration is replaced wholesale, which clears the draining mark. That is deliberate — a
 // pod whose drain was aborted must be able to rejoin without an operator clearing state.
+//
+// It is also the un-drain trap described on Registry.Deregister: this revival cannot tell an
+// aborted drain from a heartbeat loop that simply has not been stopped yet, and the mandated
+// drain order guarantees such a heartbeat is in flight. See that comment before wiring P9.
 func (m *Memory) Heartbeat(_ context.Context, n Node, now time.Time, ttl time.Duration) error {
 	if n.ID == "" || n.Addr == "" {
 		return fmt.Errorf("%w (got id=%q addr=%q)", ErrInvalidNode, n.ID, n.Addr)

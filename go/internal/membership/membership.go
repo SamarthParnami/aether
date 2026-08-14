@@ -51,7 +51,26 @@ type View struct {
 // registration; dropping it here as well means a malformed row in the store cannot reintroduce
 // the hazard behind their back.
 //
-// On duplicate IDs the first entry in ID order wins.
+// On duplicate IDs the LOWEST Addr wins, and the ordering is total over (ID, Addr).
+//
+// Ordering by ID alone is not enough, and a stable sort does not rescue it. Stability makes the
+// survivor a function of the INPUT SEQUENCE; what placement requires is a function of the node
+// SET. Those differ in exactly the scenario this defends against — a DynamoDB Scan guarantees no
+// order across pages, so two gateways reading one table receive the same rows in different orders,
+// and a stable sort faithfully preserves each gateway's own order. Same set, two page orders:
+//
+//	gateway A dials node-7 at 10.0.0.8:7001
+//	gateway B dials node-7 at 10.9.9.9:7001
+//
+// Both gateways agree on the node set and still route to different processes, because placement
+// dials Node.Addr, not Node.ID. Breaking the tie on Addr removes input order from the answer
+// entirely — which also makes stability irrelevant, so the plain SortFunc is used.
+//
+// Lowest-Addr is DETERMINISTIC BUT ARBITRARY: the row actually wanted is the newest registration
+// (a pod that re-registered on a new address), and dedup keyed on ID alone cannot express that —
+// nothing here knows which row is current. The real fix belongs in the durable layer: a
+// registration epoch on Node with newest-wins, or a store keyed by node id so duplicates cannot
+// arise. Determinism is the floor, not the ceiling.
 func NewView(nodes []Node) View {
 	routable := make([]Node, 0, len(nodes))
 	for _, n := range nodes {
@@ -60,7 +79,12 @@ func NewView(nodes []Node) View {
 		}
 		routable = append(routable, n)
 	}
-	slices.SortFunc(routable, func(a, b Node) int { return strings.Compare(a.ID, b.ID) })
+	slices.SortFunc(routable, func(a, b Node) int {
+		if c := strings.Compare(a.ID, b.ID); c != 0 {
+			return c
+		}
+		return strings.Compare(a.Addr, b.Addr)
+	})
 	return View{nodes: slices.CompactFunc(routable, func(a, b Node) bool { return a.ID == b.ID })}
 }
 
@@ -152,21 +176,40 @@ const (
 	fnvPrime64  = 1099511628211
 )
 
-// fnv1a hashes nodeID || 0x00 || roomID. The separator keeps ("ab", "c") from colliding with
-// ("a", "bc").
+// fnv1a hashes len(nodeID) as 8 big-endian bytes, then nodeID, then roomID — an unambiguous
+// framing, so no pair of distinct (nodeID, roomID) can produce the same byte stream.
+//
+// It was a 0x00 SEPARATOR, which is not sufficient. FNV-1a's XOR with 0x00 is an identity, so the
+// separator reduces to a bare multiply — and a 0x00 byte arriving IN THE INPUT performs exactly
+// that same bare multiply. The boundary was therefore indistinguishable from ordinary data:
+//
+//	weight("a\x00", "b")          == weight("a", "\x00b")
+//	weight("owner-1\x00x", "r")   == weight("owner-1", "x\x00r")
+//
+// That is client-reachable — the gateway takes the room id straight off the wire and a protobuf
+// string permits U+0000 — and a collision means two distinct placements score identically, which
+// then resolves by the node-id tie-break instead of by hash, correlating placements that are
+// supposed to be independent.
+//
+// A length prefix has no such alias: the count is fixed-width and read before any input byte, so
+// the reader always knows exactly where nodeID ends. Prefixing the FIRST field is enough — once
+// its extent is fixed, the remainder is roomID by construction.
 func fnv1a(nodeID, roomID string) uint64 {
 	h := uint64(fnvOffset64)
+	mixByte := func(b byte) {
+		h ^= uint64(b)
+		h *= fnvPrime64
+	}
 	mix := func(s string) {
 		for i := range len(s) {
-			h ^= uint64(s[i])
-			h *= fnvPrime64
+			mixByte(s[i])
 		}
 	}
 
+	for shift := 56; shift >= 0; shift -= 8 {
+		mixByte(byte(uint64(len(nodeID)) >> shift))
+	}
 	mix(nodeID)
-	// The FNV-1a step for the 0x00 separator byte. Its XOR is an identity by definition, so
-	// only the multiply is written out — that multiply is what separates the two strings.
-	h *= fnvPrime64
 	mix(roomID)
 	return h
 }
@@ -188,8 +231,32 @@ func splitmix64(x uint64) uint64 {
 //
 // Pod readiness must NOT be gated on this registry. Coupling every pod's readiness to one
 // shared store means a single store blip marks the whole fleet unready at once and stalls a
-// rollout. A caller that gets an empty or stale view is required to degrade — place locally, or
-// freeze — never to fail.
+// rollout.
+//
+// # An empty view means FREEZE, not "place locally"
+//
+// An earlier version of this doc offered "place locally" as an alternative degradation. It is
+// withdrawn: the common cause of an empty view is the store blipping, and that is a FLEET-WIDE
+// condition, so every gateway degrading locally at once means N gateways each place room R on
+// themselves. Correctness still holds — the conditional Append settles it — but the design's
+// "at most one wasted RPC" becomes an N-way claim storm aimed at a store that is already
+// unhealthy, which is the precise failure this whole layer is arranged to avoid. Ambiguity
+// freezes.
+//
+// # Clock skew here is NOT bounded the way coord's is
+//
+// coord's package doc reasons that skew only widens the failover window, because the conditional
+// Append still prevents a double-owner write. That conclusion does not transfer. Expiry is
+// written against the heartbeating node's clock and evaluated against the READER's, so a reader
+// running ahead by more than the registration TTL sees every node as expired — an empty fleet,
+// i.e. "no placement possible", which is the cold-start outage this design exists to remove.
+// There is no hard backstop for it, because nothing is being written: the failure is a silently
+// unavailable fleet rather than an unsafe one.
+//
+// It is also indistinguishable at this interface: View returns (empty, nil) whether the fleet is
+// genuinely empty or merely all-expired. A durable implementation should be able to tell those
+// apart — "no rows" vs "rows, all expired" — so the skew case is alertable instead of looking
+// like a fresh cluster.
 type Registry interface {
 	// Heartbeat records n as live until now.Add(ttl); callers re-send well inside ttl. It
 	// rejects a node with an empty ID or Addr — see NewView for why that one matters.
@@ -198,6 +265,20 @@ type Registry interface {
 	// Deregister marks nodeID as gone immediately, without waiting out its ttl. It is the first
 	// step of a graceful drain and must run BEFORE the node stops accepting rooms: reversed, a
 	// reader holding a slightly stale view places rooms straight back onto the departing node.
+	//
+	// UNRESOLVED — this contract and Heartbeat's resurrection currently contradict each other, and
+	// the caller that would trip it (cmd/aether-node, P9) does not exist yet. Deregister is
+	// mandated to run BEFORE the node stops serving, but the node's own heartbeat loop is still
+	// ticking during exactly that window, and Heartbeat deliberately revives a deregistered node.
+	// So a drain can silently un-drain: Deregister returns nil, one View shows the node gone, and
+	// moments later it is back taking placements while it exits.
+	//
+	// Each half is individually reasonable; together they are a trap, and an ordering rule that
+	// lives only in a doc comment is one that eventually gets violated. The likely fix is to make
+	// revival an explicit Register/Rejoin distinct from Heartbeat, so an in-flight heartbeat is
+	// STRUCTURALLY unable to perform it — but that reshapes this interface, so it is called out
+	// here rather than decided in passing. Until then, a drain must stop its heartbeat loop before
+	// calling Deregister.
 	Deregister(ctx context.Context, nodeID string, now time.Time) error
 
 	// View returns the nodes live at now.
