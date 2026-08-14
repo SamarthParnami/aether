@@ -34,9 +34,9 @@ func TestWeightIsPinned(t *testing.T) {
 		node, room string
 		want       uint64
 	}{
-		{"owner-0", "room", 0xe7007560283a9902},
-		{"owner-1", "room", 0x275866e58b7c79c0},
-		{"", "", 0x71b8262bb6e2e086},
+		{"owner-0", "room", 0x7807398e0d04b899},
+		{"owner-1", "room", 0xe62f77b627dde9be},
+		{"", "", 0x5ba314b8cfda3b6b},
 	}
 
 	for _, c := range cases {
@@ -89,5 +89,32 @@ func TestSplitmix64Avalanches(t *testing.T) {
 
 	if avg := float64(total) / trials; avg < 24 || avg > 40 {
 		t.Errorf("average bit flips = %.1f, want ~32 (±8) — the finalizer is not avalanching", avg)
+	}
+}
+
+// TestSeparatorIsNotAliasedByNULInInput extends the separator test to the case it missed.
+//
+// The separator is written as a bare multiply because FNV-1a's XOR with 0x00 is an identity — but
+// that is exactly why a 0x00 byte ARRIVING IN THE INPUT is byte-for-byte indistinguishable from
+// the separator. The framing is ambiguous, so a NUL anywhere in either string can be re-read as
+// the boundary, and two different (node, room) pairs hash identically.
+//
+// It is client-reachable: gateway/server.go takes room := join.GetRoomId() with no validation, and
+// a protobuf `string` field permits U+0000. The original golden vector even includes room "\x00",
+// so NUL-as-input was considered — NUL-as-separator-alias was not.
+func TestSeparatorIsNotAliasedByNULInInput(t *testing.T) {
+	pairs := [][2][2]string{
+		{{"a\x00", "b"}, {"a", "\x00b"}},
+		{{"\x00", ""}, {"", "\x00"}},
+		{{"owner-1\x00x", "r"}, {"owner-1", "x\x00r"}},
+	}
+
+	for _, p := range pairs {
+		left, right := weight(p[0][0], p[0][1]), weight(p[1][0], p[1][1])
+		if left == right {
+			t.Errorf("weight(%q,%q) == weight(%q,%q) == %#016x — a NUL in the input aliases the "+
+				"field boundary, so two distinct placements collide",
+				p[0][0], p[0][1], p[1][0], p[1][1], left)
+		}
 	}
 }

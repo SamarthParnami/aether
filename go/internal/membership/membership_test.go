@@ -46,17 +46,22 @@ var goldenNodes = []string{"owner-0", "owner-1", "owner-2", "node-a", "node-b"}
 // mean to re-place every room in production".
 //
 // The room ids include the empty string and a lone NUL, plus the "ab"/"a" pair that would
-// collide if the separator between node id and room id were ever dropped.
+// collide if the node id's length prefix were ever dropped.
+//
+// These values were re-goldened once, deliberately, when the 0x00 separator was replaced by that
+// length prefix (a NUL in the input aliased the separator). Doing it before there is a cmd/ or
+// anything deployed cost one golden update against zero production rooms; the same change later
+// would re-place every live room simultaneously.
 func TestRankGoldenVector(t *testing.T) {
 	golden := map[string][]string{
-		"":             {"node-b", "owner-1", "node-a", "owner-2", "owner-0"},
-		"room":         {"owner-0", "node-a", "node-b", "owner-1", "owner-2"},
-		"class-721363": {"owner-2", "owner-0", "node-a", "node-b", "owner-1"},
-		"r-1":          {"node-b", "owner-2", "owner-0", "node-a", "owner-1"},
-		"r-2":          {"owner-2", "owner-0", "node-b", "node-a", "owner-1"},
-		"\x00":         {"node-a", "owner-0", "owner-2", "owner-1", "node-b"},
-		"ab":           {"owner-2", "owner-1", "node-b", "owner-0", "node-a"},
-		"a":            {"node-b", "node-a", "owner-0", "owner-1", "owner-2"},
+		"":             {"node-b", "owner-1", "owner-2", "node-a", "owner-0"},
+		"room":         {"owner-1", "node-b", "owner-0", "node-a", "owner-2"},
+		"class-721363": {"owner-1", "owner-0", "node-a", "owner-2", "node-b"},
+		"r-1":          {"owner-0", "node-b", "node-a", "owner-1", "owner-2"},
+		"r-2":          {"owner-2", "owner-1", "node-b", "node-a", "owner-0"},
+		"\x00":         {"node-b", "owner-2", "node-a", "owner-0", "owner-1"},
+		"ab":           {"owner-0", "owner-2", "owner-1", "node-a", "node-b"},
+		"a":            {"node-a", "owner-1", "node-b", "owner-0", "owner-2"},
 	}
 
 	v := viewOf(goldenNodes...)
