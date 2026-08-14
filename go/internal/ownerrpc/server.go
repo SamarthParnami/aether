@@ -2,8 +2,13 @@
 // roomruntime.Runtime. It is the owner side of 05-design-gateway.md's gateway↔owner RPC: a gateway
 // resolves a room's owner via the coord directory and calls this server.
 //
-// Error mapping: a node that does not (or no longer) owns the room returns a Connect
-// FAILED_PRECONDITION so the gateway re-resolves and retries — never a silent wrong answer.
+// Error mapping, in two kinds — never a silent wrong answer:
+//
+//   - FAILED_PRECONDITION: this node does not (or no longer) own the room. The gateway re-resolves
+//     the directory and retries against the real owner.
+//   - RESOURCE_EXHAUSTED: this node COULD own the room and is refusing it (draining, or at its room
+//     cap). Re-resolving would be useless — the directory has nothing new to say — so the gateway
+//     must try a different node instead. Kept distinct precisely because the recovery differs.
 package ownerrpc
 
 import (
@@ -28,6 +33,21 @@ type Server struct {
 // NewServer wraps rt as a RoomService handler.
 func NewServer(rt *roomruntime.Runtime) *Server { return &Server{rt: rt} }
 
+// routingError maps the errors that tell the gateway WHERE TO GO NEXT onto their Connect codes,
+// returning nil for anything else (including nil). One function rather than the same switch in five
+// handlers: the codes are a wire contract, and five copies is five chances for one to drift.
+func routingError(err error) *connect.Error {
+	switch {
+	case errors.Is(err, roomruntime.ErrNotOwner):
+		// Wrong node — the directory knows the right one.
+		return connect.NewError(connect.CodeFailedPrecondition, err)
+	case errors.Is(err, roomruntime.ErrDraining), errors.Is(err, roomruntime.ErrAtCapacity):
+		// Right node, refused. The directory would just send the caller back here.
+		return connect.NewError(connect.CodeResourceExhausted, err)
+	}
+	return nil
+}
+
 // Commit maps RoomService.Commit onto Runtime.Commit's three outcomes: committed, duplicate, or a
 // not-owner failure the gateway re-resolves on.
 func (s *Server) Commit(
@@ -35,9 +55,12 @@ func (s *Server) Commit(
 ) (*connect.Response[aetherv1.CommitResponse], error) {
 	m := req.Msg
 	ev, applied, err := s.rt.Commit(ctx, m.GetRoomId(), m.GetClientId(), m.GetClientSeq(), m.GetBody())
+	if ce := routingError(err); ce != nil {
+		return nil, ce
+	}
 	switch {
-	case errors.Is(err, roomruntime.ErrNotOwner), errors.Is(err, logstore.ErrConflict):
-		// Not (or no longer) the owner — the gateway re-resolves and retries.
+	case errors.Is(err, logstore.ErrConflict):
+		// Lost the conditional append — same signal as not-owner: re-resolve and retry.
 		return nil, connect.NewError(connect.CodeFailedPrecondition, err)
 	case err != nil:
 		return nil, connect.NewError(connect.CodeInternal, err)
@@ -59,10 +82,10 @@ func (s *Server) GetSnapshot(
 	ctx context.Context, req *connect.Request[aetherv1.GetSnapshotRequest],
 ) (*connect.Response[aetherv1.GetSnapshotResponse], error) {
 	joined, err := s.rt.Join(ctx, req.Msg.GetRoomId())
-	switch {
-	case errors.Is(err, roomruntime.ErrNotOwner):
-		return nil, connect.NewError(connect.CodeFailedPrecondition, err)
-	case err != nil:
+	if ce := routingError(err); ce != nil {
+		return nil, ce
+	}
+	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 	snap := joined.GetSnapshot()
@@ -88,8 +111,8 @@ func (s *Server) Subscribe(
 	if ctx.Err() != nil {
 		return nil
 	}
-	if errors.Is(err, roomruntime.ErrNotOwner) {
-		return connect.NewError(connect.CodeFailedPrecondition, err)
+	if ce := routingError(err); ce != nil {
+		return ce
 	}
 	// TODO(compaction): when Tail gains a log-floor check, map its "from_seq too old" sentinel to
 	// connect.CodeOutOfRange here, so the gateway's deep-resume fallback (GetSnapshot + Subscribe
@@ -103,10 +126,11 @@ func (s *Server) Broadcast(
 	ctx context.Context, req *connect.Request[aetherv1.BroadcastRequest],
 ) (*connect.Response[aetherv1.BroadcastResponse], error) {
 	m := req.Msg
-	switch err := s.rt.Broadcast(ctx, m.GetRoomId(), m.GetOriginClientId(), m.GetBody()); {
-	case errors.Is(err, roomruntime.ErrNotOwner):
-		return nil, connect.NewError(connect.CodeFailedPrecondition, err)
-	case err != nil:
+	err := s.rt.Broadcast(ctx, m.GetRoomId(), m.GetOriginClientId(), m.GetBody())
+	if ce := routingError(err); ce != nil {
+		return nil, ce
+	}
+	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 	return connect.NewResponse(&aetherv1.BroadcastResponse{}), nil
@@ -127,8 +151,8 @@ func (s *Server) SubscribeEphemeral(
 	if ctx.Err() != nil {
 		return nil
 	}
-	if errors.Is(err, roomruntime.ErrNotOwner) {
-		return connect.NewError(connect.CodeFailedPrecondition, err)
+	if ce := routingError(err); ce != nil {
+		return ce
 	}
 	return err
 }

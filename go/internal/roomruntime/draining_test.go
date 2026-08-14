@@ -1,0 +1,204 @@
+package roomruntime_test
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	aetherv1 "github.com/SamarthParnami/aether/go/gen/aether/v1"
+	"github.com/SamarthParnami/aether/go/internal/coord"
+	"github.com/SamarthParnami/aether/go/internal/fanout"
+	"github.com/SamarthParnami/aether/go/internal/logstore"
+	"github.com/SamarthParnami/aether/go/internal/roomruntime"
+)
+
+// node returns a single runtime over its own coordinator, plus the coordinator so a test can check
+// the directory directly — "did the node actually take the lease" is not answerable from the
+// runtime alone.
+func node(t *testing.T, opts ...roomruntime.Option) (*roomruntime.Runtime, *coord.Memory) {
+	t.Helper()
+	co := coord.NewMemory()
+	opts = append([]roomruntime.Option{
+		roomruntime.WithNodeID("A"),
+		roomruntime.WithAddr("a.example:7001"),
+		roomruntime.WithCoordinator(co),
+	}, opts...)
+	return roomruntime.New(logstore.NewMemory(), fanout.NewMemory(), opts...), co
+}
+
+// leased reports whether the directory currently names an owner for the room.
+func leased(t *testing.T, co *coord.Memory, roomID string) bool {
+	t.Helper()
+	_, ok, err := co.Current(t.Context(), roomID, time.Now())
+	if err != nil {
+		t.Fatalf("coord.Current(%q): %v", roomID, err)
+	}
+	return ok
+}
+
+// The exit criterion for draining: a node that has released a room must not take it back. Without
+// this, preStop is a loop that fights itself — Release hands the room over, and the next in-flight
+// request (or the relay's own Tail re-acquiring) claims it straight back, so the pod exits still
+// holding a live lease that names an address about to go dark for a full TTL.
+func TestDrainingNodeNeverRetakesAReleasedRoom(t *testing.T) {
+	ctx := context.Background()
+	rt, co := node(t)
+
+	if _, applied, err := rt.Commit(ctx, "room", "x", 1, kvBody("k", "v")); err != nil || !applied {
+		t.Fatalf("warm-up commit: applied=%v err=%v", applied, err)
+	}
+
+	rt.SetDraining(true)
+	if err := rt.Release(ctx, "room"); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+
+	// Every path that acquires must refuse, not just the write path — the relay's Tail is the one
+	// that actually caused this race in practice.
+	if _, _, err := rt.Commit(ctx, "room", "x", 2, kvBody("k", "v2")); !errors.Is(err, roomruntime.ErrDraining) {
+		t.Errorf("Commit after drain+release = %v, want ErrDraining", err)
+	}
+	if _, err := rt.Join(ctx, "room"); !errors.Is(err, roomruntime.ErrDraining) {
+		t.Errorf("Join after drain+release = %v, want ErrDraining", err)
+	}
+	tailErr := rt.Tail(ctx, "room", 0, func(*aetherv1.Event) error { return nil })
+	if !errors.Is(tailErr, roomruntime.ErrDraining) {
+		t.Errorf("Tail after drain+release = %v, want ErrDraining", tailErr)
+	}
+
+	if leased(t, co, "room") {
+		t.Fatal("the released room is leased again — a draining node re-took it")
+	}
+}
+
+// Draining gates ADMISSION only. A node mid-drain still owns rooms it hasn't handed over yet, and
+// cutting them off at the moment preStop fires would drop every live session instead of migrating
+// them one at a time.
+func TestDrainingKeepsServingRoomsItStillOwns(t *testing.T) {
+	ctx := context.Background()
+	rt, _ := node(t)
+
+	if _, applied, err := rt.Commit(ctx, "room", "x", 1, kvBody("k", "v")); err != nil || !applied {
+		t.Fatalf("warm-up commit: applied=%v err=%v", applied, err)
+	}
+
+	rt.SetDraining(true)
+
+	if _, applied, err := rt.Commit(ctx, "room", "x", 2, kvBody("k", "v2")); err != nil || !applied {
+		t.Fatalf("commit to an owned room while draining: applied=%v err=%v", applied, err)
+	}
+	// A room it does NOT own is refused at the same moment.
+	if _, _, err := rt.Commit(ctx, "other", "x", 1, kvBody("k", "v")); !errors.Is(err, roomruntime.ErrDraining) {
+		t.Fatalf("commit to a new room while draining = %v, want ErrDraining", err)
+	}
+}
+
+// Draining is reversible, unlike Shutdown. An aborted rolling deploy or a health check that
+// recovers must be able to put the node back in service without restarting the process.
+func TestDrainingIsReversible(t *testing.T) {
+	ctx := context.Background()
+	rt, co := node(t)
+
+	rt.SetDraining(true)
+	if _, _, err := rt.Commit(ctx, "room", "x", 1, kvBody("k", "v")); !errors.Is(err, roomruntime.ErrDraining) {
+		t.Fatalf("commit while draining = %v, want ErrDraining", err)
+	}
+
+	rt.SetDraining(false)
+	if _, applied, err := rt.Commit(ctx, "room", "x", 1, kvBody("k", "v")); err != nil || !applied {
+		t.Fatalf("commit after drain cleared: applied=%v err=%v", applied, err)
+	}
+	if !leased(t, co, "room") {
+		t.Fatal("node served the room without taking its lease")
+	}
+}
+
+// A draining refusal must stay distinguishable from an ownership verdict. Collapsing them would
+// send the gateway back to the directory, which would name this same node again — a refusal loop
+// rather than a handover.
+func TestDrainingIsNotErrNotOwner(t *testing.T) {
+	ctx := context.Background()
+	rt, _ := node(t)
+	rt.SetDraining(true)
+
+	_, _, err := rt.Commit(ctx, "room", "x", 1, kvBody("k", "v"))
+	if errors.Is(err, roomruntime.ErrNotOwner) {
+		t.Fatalf("draining reported as ErrNotOwner (%v) — the gateway would re-resolve straight "+
+			"back to this node instead of trying another", err)
+	}
+	if !errors.Is(err, roomruntime.ErrDraining) {
+		t.Fatalf("commit while draining = %v, want ErrDraining", err)
+	}
+}
+
+// The capacity cap bounds how much placement can pile onto one node. The hash distributes by id and
+// knows nothing about load, so without a cap a node has no way to decline.
+func TestMaxRoomsRefusesBeyondTheCap(t *testing.T) {
+	ctx := context.Background()
+	rt, co := node(t, roomruntime.WithMaxRooms(2))
+
+	for _, room := range []string{"room-1", "room-2"} {
+		if _, applied, err := rt.Commit(ctx, room, "x", 1, kvBody("k", "v")); err != nil || !applied {
+			t.Fatalf("%s commit: applied=%v err=%v", room, applied, err)
+		}
+	}
+
+	if _, _, err := rt.Commit(ctx, "room-3", "x", 1, kvBody("k", "v")); !errors.Is(err, roomruntime.ErrAtCapacity) {
+		t.Fatalf("commit beyond the cap = %v, want ErrAtCapacity", err)
+	}
+	if leased(t, co, "room-3") {
+		t.Fatal("a refused room was leased anyway — the gate ran after the claim")
+	}
+}
+
+// At capacity, the rooms already owned keep working. A cap that shed existing rooms would make
+// every node's load oscillate instead of settle.
+func TestMaxRoomsDoesNotEvictOwnedRooms(t *testing.T) {
+	ctx := context.Background()
+	rt, _ := node(t, roomruntime.WithMaxRooms(1))
+
+	if _, applied, err := rt.Commit(ctx, "room-1", "x", 1, kvBody("k", "v")); err != nil || !applied {
+		t.Fatalf("room-1 commit: applied=%v err=%v", applied, err)
+	}
+	if _, _, err := rt.Commit(ctx, "room-2", "x", 1, kvBody("k", "v")); !errors.Is(err, roomruntime.ErrAtCapacity) {
+		t.Fatalf("room-2 commit = %v, want ErrAtCapacity", err)
+	}
+	// room-1 is unaffected by the node being full.
+	if _, applied, err := rt.Commit(ctx, "room-1", "x", 2, kvBody("k", "v2")); err != nil || !applied {
+		t.Fatalf("room-1 commit while at capacity: applied=%v err=%v", applied, err)
+	}
+}
+
+// Releasing a room frees a capacity slot — the cap tracks what is owned NOW, not a high-water mark.
+func TestMaxRoomsFreesASlotOnRelease(t *testing.T) {
+	ctx := context.Background()
+	rt, _ := node(t, roomruntime.WithMaxRooms(1))
+
+	if _, applied, err := rt.Commit(ctx, "room-1", "x", 1, kvBody("k", "v")); err != nil || !applied {
+		t.Fatalf("room-1 commit: applied=%v err=%v", applied, err)
+	}
+	if _, _, err := rt.Commit(ctx, "room-2", "x", 1, kvBody("k", "v")); !errors.Is(err, roomruntime.ErrAtCapacity) {
+		t.Fatalf("room-2 commit = %v, want ErrAtCapacity", err)
+	}
+
+	if err := rt.Release(ctx, "room-1"); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if _, applied, err := rt.Commit(ctx, "room-2", "x", 1, kvBody("k", "v")); err != nil || !applied {
+		t.Fatalf("room-2 commit after a slot freed: applied=%v err=%v", applied, err)
+	}
+}
+
+// Zero (the default) means unlimited — the Phase-1 behaviour must be unchanged for anyone who does
+// not opt in.
+func TestMaxRoomsZeroIsUnlimited(t *testing.T) {
+	ctx := context.Background()
+	rt, _ := node(t)
+
+	for _, room := range []string{"r1", "r2", "r3", "r4", "r5"} {
+		if _, applied, err := rt.Commit(ctx, room, "x", 1, kvBody("k", "v")); err != nil || !applied {
+			t.Fatalf("%s commit: applied=%v err=%v", room, applied, err)
+		}
+	}
+}

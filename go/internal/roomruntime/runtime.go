@@ -53,6 +53,26 @@ const defaultTailPollInterval = 3 * time.Second
 // or retry after the lease lapses; it must not treat the operation as applied.
 var ErrNotOwner = errors.New("roomruntime: not the room owner")
 
+// ErrDraining and ErrAtCapacity are REFUSALS, not ownership verdicts: this node could serve the
+// room and is choosing not to. They are distinct from ErrNotOwner because the caller must do
+// something different with them — ErrNotOwner says "go find the owner", these say "go find ANOTHER
+// node", and once placement exists that means advancing to the next-ranked candidate rather than
+// re-resolving the directory and arriving back here.
+//
+// Both gate ADMISSION only. A room this node already owns keeps being served until it is explicitly
+// Released, or draining would cut live sessions the instant preStop fired instead of handing them
+// over, and a capacity limit would evict rooms rather than decline new ones.
+var (
+	// ErrDraining is returned when this node is shutting down and no longer accepts new rooms. Set
+	// by preStop BEFORE the rooms are released — the ordering is load-bearing (see SetDraining).
+	ErrDraining = errors.New("roomruntime: node is draining")
+
+	// ErrAtCapacity is returned when this node already owns WithMaxRooms rooms. A genuine
+	// load-shedding valve: without it the placement function's opinion is the only thing bounding a
+	// node's room count, and a hash is not aware of load.
+	ErrAtCapacity = errors.New("roomruntime: node is at room capacity")
+)
+
 // Runtime owns a set of rooms on this node. Ownership is enforced per room via the coord
 // lease; a Runtime serves only rooms whose lease it currently holds.
 type Runtime struct {
@@ -80,6 +100,11 @@ type Runtime struct {
 	// closed is set by Shutdown. It makes acquire refuse, which is load-bearing: acquire CLAIMS,
 	// so without it any request still in flight would instantly re-take a room we just released.
 	closed bool
+	// draining is set by SetDraining (preStop). Unlike closed it is reversible and refuses only NEW
+	// rooms, so a node keeps serving what it owns while it hands them over one at a time.
+	draining bool
+	// maxRooms caps how many rooms this node will take on; 0 means unlimited.
+	maxRooms int
 }
 
 // Option configures a Runtime. Unset options fall back to single-node defaults: a private
@@ -114,6 +139,15 @@ func WithClock(now func() time.Time) Option { return func(r *Runtime) { r.now = 
 
 // WithLeaseTTL sets the lease lifetime acquired on each claim/renew.
 func WithLeaseTTL(ttl time.Duration) Option { return func(r *Runtime) { r.ttl = ttl } }
+
+// WithMaxRooms caps the number of rooms this node will own at once; beyond it, acquiring a NEW room
+// returns ErrAtCapacity while rooms already owned keep being served. Zero (the default) is
+// unlimited, which is the Phase-1 behaviour.
+//
+// This is the only backpressure a node has against placement. The placement function distributes by
+// hash, which knows nothing about load — so a room that is unusually expensive, or a fleet that has
+// just lost half its nodes, would otherwise pile onto whoever the hash names with no way to say no.
+func WithMaxRooms(n int) Option { return func(r *Runtime) { r.maxRooms = n } }
 
 // WithTailPollInterval sets how often Tail re-reads the log absent a fan-out wakeup — the bound on
 // read staleness when the room is served by a node that isn't being woken (e.g. after a re-home).
@@ -230,6 +264,27 @@ func (r *Runtime) Join(ctx context.Context, roomID string) (*aetherv1.Joined, er
 	}, nil
 }
 
+// SetDraining marks this node as accepting no NEW rooms (or clears that). Rooms already owned are
+// unaffected and keep being served until Released, so a drain is a handover rather than a cut.
+//
+// Reversible on purpose, unlike Shutdown's closed: a preStop that is cancelled (a rolling deploy
+// aborted, a failed health check that recovers) must be able to put the node back into service
+// without restarting it.
+//
+// The preStop ORDER is load-bearing and silently wrong if reversed:
+//
+//	Deregister → wait 2× view refresh → SetDraining(true) → Release each room → exit
+//
+// Deregistering first is what makes the drain converge. Because a node is gateway + owner in one
+// binary, a gateway holding a slightly stale fleet view can still rank this pod first — and if the
+// rooms were released before the view caught up, that gateway would place them straight back onto
+// the pod that is exiting. The wait covers the staleness; draining covers whatever slips through it.
+func (r *Runtime) SetDraining(draining bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.draining = draining
+}
+
 // Release gracefully relinquishes ownership of a room (e.g. on a planned shutdown) so a
 // survivor can take over immediately instead of waiting out the lease TTL. The in-memory room
 // is dropped; a later request re-homes it (re-claiming if the room is still free).
@@ -309,6 +364,18 @@ func (r *Runtime) acquire(ctx context.Context, roomID string) error {
 	// them immediately; claiming again here would snatch one straight back.
 	if r.closed {
 		return ErrNotOwner
+	}
+	// Admission gates apply only to rooms this node does not already hold. Serving an owned room is
+	// never refused: draining hands rooms over one at a time (a blanket refusal would cut every live
+	// session the moment preStop fired), and a capacity cap declines new work rather than evicting
+	// existing work.
+	if _, held := r.owned[roomID]; !held {
+		if r.draining {
+			return ErrDraining
+		}
+		if r.maxRooms > 0 && len(r.owned) >= r.maxRooms {
+			return ErrAtCapacity
+		}
 	}
 	_, ok, err := r.coord.Claim(ctx, roomID, r.nodeID, r.addr, r.now(), r.ttl)
 	if err != nil {
