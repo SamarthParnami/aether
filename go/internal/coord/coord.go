@@ -41,7 +41,12 @@ type Lease struct {
 // timeout rendered as "not held" is indistinguishable from "this room is unowned", and routing
 // reads "unowned" as an invitation to place the room somewhere. That would aim a claim storm at a
 // store already failing. Callers check err FIRST and freeze on ambiguity; only a nil error makes
-// the bool meaningful (01-design-backbone.md:240).
+// the bool meaningful.
+//
+// The principle is 01-design-backbone.md §6.4's lease fail-safe — "ambiguity → freeze, never assume
+// ownership" — though note §6.4 scopes it to refusing WRITES. Extending it to routing (an
+// unanswered directory read must not be rendered as "unowned", because that reads as permission to
+// place) is this layer's own conclusion, not something §6.4 states.
 //
 // # Two requirements on any durable implementation
 //
