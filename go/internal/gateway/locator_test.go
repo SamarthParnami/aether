@@ -26,6 +26,16 @@ func kvBody(key, val string) *aetherv1.EventBody {
 	}
 }
 
+// mustClaim seeds the directory with a lease, failing the test if the coordinator errors.
+func mustClaim(
+	t *testing.T, co coord.Coordinator, room, owner, addr string, now time.Time, ttl time.Duration,
+) {
+	t.Helper()
+	if _, ok, err := co.Claim(t.Context(), room, owner, addr, now, ttl); err != nil || !ok {
+		t.Fatalf("seed Claim(%q, %q): ok=%v err=%v", room, owner, ok, err)
+	}
+}
+
 // startOwner brings up an owner node — a roomruntime.Runtime serving the RoomService RPC on a real
 // loopback listener — and returns its runtime plus a stop func to kill the node (for failover /
 // relay-death tests). Binding the listener first lets the runtime publish its own addr (WithAddr)
@@ -74,7 +84,7 @@ func TestLocatorResolvesAndDialsOwner(t *testing.T) {
 	}
 
 	loc := gateway.NewOwnerLocator(co)
-	client, _, err := loc.Owner("room")
+	client, _, err := loc.Owner(ctx, "room")
 	if err != nil {
 		t.Fatalf("Owner(room): %v", err)
 	}
@@ -94,7 +104,7 @@ func TestLocatorResolvesAndDialsOwner(t *testing.T) {
 // A room with no live lease has no owner to dial.
 func TestLocatorNoOwner(t *testing.T) {
 	loc := gateway.NewOwnerLocator(coord.NewMemory())
-	if _, _, err := loc.Owner("nope"); !errors.Is(err, gateway.ErrNoOwner) {
+	if _, _, err := loc.Owner(t.Context(), "nope"); !errors.Is(err, gateway.ErrNoOwner) {
 		t.Fatalf("Owner of an unowned room = %v, want ErrNoOwner", err)
 	}
 }
@@ -103,10 +113,10 @@ func TestLocatorNoOwner(t *testing.T) {
 // re-resolves rather than dialing a black hole.
 func TestLocatorEmptyAddrIsNoOwner(t *testing.T) {
 	co := coord.NewMemory()
-	co.Claim("room", "owner-without-addr", "", time.Now(), 10*time.Second) // empty addr
+	mustClaim(t, co, "room", "owner-without-addr", "", time.Now(), 10*time.Second) // empty addr
 
 	loc := gateway.NewOwnerLocator(co)
-	if _, _, err := loc.Owner("room"); !errors.Is(err, gateway.ErrNoOwner) {
+	if _, _, err := loc.Owner(t.Context(), "room"); !errors.Is(err, gateway.ErrNoOwner) {
 		t.Fatalf("Owner with empty addr = %v, want ErrNoOwner", err)
 	}
 }
@@ -115,12 +125,12 @@ func TestLocatorEmptyAddrIsNoOwner(t *testing.T) {
 func TestLocatorExpiredLeaseIsNoOwner(t *testing.T) {
 	co := coord.NewMemory()
 	t0 := time.Unix(1000, 0)
-	co.Claim("room", "owner", "127.0.0.1:9999", t0, 10*time.Second) // expires at t0+10s
+	mustClaim(t, co, "room", "owner", "127.0.0.1:9999", t0, 10*time.Second) // expires at t0+10s
 
 	loc := gateway.NewOwnerLocator(co, gateway.WithLocatorClock(func() time.Time {
 		return t0.Add(11 * time.Second) // past expiry
 	}))
-	if _, _, err := loc.Owner("room"); !errors.Is(err, gateway.ErrNoOwner) {
+	if _, _, err := loc.Owner(t.Context(), "room"); !errors.Is(err, gateway.ErrNoOwner) {
 		t.Fatalf("Owner of a lapsed lease = %v, want ErrNoOwner", err)
 	}
 }
@@ -128,14 +138,14 @@ func TestLocatorExpiredLeaseIsNoOwner(t *testing.T) {
 // The locator pools one client per owner address rather than dialing afresh each call.
 func TestLocatorPoolsClientPerOwner(t *testing.T) {
 	co := coord.NewMemory()
-	co.Claim("room", "owner", "127.0.0.1:9999", time.Now(), 10*time.Second)
+	mustClaim(t, co, "room", "owner", "127.0.0.1:9999", time.Now(), 10*time.Second)
 
 	loc := gateway.NewOwnerLocator(co)
-	a, _, err := loc.Owner("room")
+	a, _, err := loc.Owner(t.Context(), "room")
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, _, err := loc.Owner("room")
+	b, _, err := loc.Owner(t.Context(), "room")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,15 +158,15 @@ func TestLocatorPoolsClientPerOwner(t *testing.T) {
 // pooling, so dead clients don't linger as owner addresses churn across deploys.
 func TestLocatorInvalidateEvictsClient(t *testing.T) {
 	co := coord.NewMemory()
-	co.Claim("room", "owner", "127.0.0.1:9999", time.Now(), 10*time.Second)
+	mustClaim(t, co, "room", "owner", "127.0.0.1:9999", time.Now(), 10*time.Second)
 
 	loc := gateway.NewOwnerLocator(co)
-	a, addr, err := loc.Owner("room")
+	a, addr, err := loc.Owner(t.Context(), "room")
 	if err != nil {
 		t.Fatal(err)
 	}
 	loc.Invalidate(addr)
-	b, _, err := loc.Owner("room")
+	b, _, err := loc.Owner(t.Context(), "room")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -113,7 +113,9 @@ func TestGracefulReleaseHandsOffImmediately(t *testing.T) {
 		t.Fatalf("B should be blocked while A owns; err=%v", err)
 	}
 
-	a.Release("room") // planned handoff — no TTL wait
+	if err := a.Release(ctx, "room"); err != nil { // planned handoff — no TTL wait
+		t.Fatalf("Release: %v", err)
+	}
 
 	if _, applied, err := b.Commit(ctx, "room", "y", 1, kvBody("k", "v2")); err != nil || !applied {
 		t.Fatalf("B after A.Release: applied=%v err=%v", applied, err)
@@ -155,7 +157,10 @@ func TestRuntimePublishesAddrIntoLease(t *testing.T) {
 		t.Fatalf("commit: applied=%v err=%v", applied, err)
 	}
 
-	lease, ok := co.Current("room", clk.now())
+	lease, ok, err := co.Current(ctx, "room", clk.now())
+	if err != nil {
+		t.Fatalf("coord.Current: unexpected error: %v", err)
+	}
 	if !ok || lease.Owner != "A" || lease.Addr != "a.example:7001" {
 		t.Fatalf("directory lease = %+v, %v; want owner A @ a.example:7001", lease, ok)
 	}

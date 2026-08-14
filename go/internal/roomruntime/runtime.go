@@ -24,6 +24,7 @@ package roomruntime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -175,7 +176,7 @@ func (r *Runtime) commitLocked(
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if err := r.acquire(roomID); err != nil {
+	if err := r.acquire(ctx, roomID); err != nil {
 		return nil, false, err
 	}
 	room, err := r.ensureRoom(ctx, roomID)
@@ -211,7 +212,7 @@ func (r *Runtime) Join(ctx context.Context, roomID string) (*aetherv1.Joined, er
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if err := r.acquire(roomID); err != nil {
+	if err := r.acquire(ctx, roomID); err != nil {
 		return nil, err
 	}
 	room, err := r.ensureRoom(ctx, roomID)
@@ -232,10 +233,14 @@ func (r *Runtime) Join(ctx context.Context, roomID string) (*aetherv1.Joined, er
 // Release gracefully relinquishes ownership of a room (e.g. on a planned shutdown) so a
 // survivor can take over immediately instead of waiting out the lease TTL. The in-memory room
 // is dropped; a later request re-homes it (re-claiming if the room is still free).
-func (r *Runtime) Release(roomID string) {
+//
+// A non-nil error means the lease may still be held: the room stays unroutable until the TTL
+// lapses rather than re-homing at once. Worth logging at the call site — silently discarding it
+// is how a rolling deploy quietly turns into a TTL of dead rooms.
+func (r *Runtime) Release(ctx context.Context, roomID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.releaseLocked(roomID)
+	return r.releaseLocked(ctx, roomID)
 }
 
 // Shutdown relinquishes EVERY room this node owns and permanently stops it taking on more. It is
@@ -257,23 +262,36 @@ func (r *Runtime) Release(roomID string) {
 // lands with cmd/. A gateway whose stream outlives the release keeps reading an owner that no
 // longer owns the room until the stream dies, so the two must be sequenced together at the call
 // site: stop the RPC server, then Shutdown the runtime.
-func (r *Runtime) Shutdown() {
+// Every room is attempted even if one release fails; the failures are joined and returned, so a
+// single unreachable-store room cannot strand the rest of the node's leases.
+func (r *Runtime) Shutdown(ctx context.Context) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	r.closed = true
+	var errs []error
 	for roomID := range r.owned {
-		r.releaseLocked(roomID)
+		if err := r.releaseLocked(ctx, roomID); err != nil {
+			errs = append(errs, err)
+		}
 	}
+	return errors.Join(errs...)
 }
 
 // releaseLocked gives up one room's lease and drops its in-memory state. Caller must hold r.mu.
 // coord.Release is a no-op unless this node is the current holder, so releasing a room whose lease
 // we already lost cannot revoke the new owner's claim.
-func (r *Runtime) releaseLocked(roomID string) {
-	r.coord.Release(roomID, r.nodeID)
+// The in-memory state is dropped even when the release fails: this node has stopped serving the
+// room either way, and a failed release only means the survivor waits out the TTL instead of
+// taking over immediately — the slow path, not an incorrect one.
+func (r *Runtime) releaseLocked(ctx context.Context, roomID string) error {
+	err := r.coord.Release(ctx, roomID, r.nodeID)
 	delete(r.rooms, roomID)
 	delete(r.owned, roomID)
+	if err != nil {
+		return fmt.Errorf("coord release %q: %w", roomID, err)
+	}
+	return nil
 }
 
 // acquire confirms this node holds the room's ownership lease, claiming it if the room is free
@@ -286,13 +304,21 @@ func (r *Runtime) releaseLocked(roomID string) {
 // one durable write NOT conditioned on room_seq, logstore.WriteSnapshot (today an unconditional
 // overwrite), so a zombie owner can't clobber a fresher snapshot with a stale one. We thread
 // the token into snapshot writes when snapshots are added.
-func (r *Runtime) acquire(roomID string) error {
+func (r *Runtime) acquire(ctx context.Context, roomID string) error {
 	// A shut-down node must never re-claim. Shutdown released these rooms so a survivor could take
 	// them immediately; claiming again here would snatch one straight back.
 	if r.closed {
 		return ErrNotOwner
 	}
-	if _, ok := r.coord.Claim(roomID, r.nodeID, r.addr, r.now(), r.ttl); !ok {
+	_, ok, err := r.coord.Claim(ctx, roomID, r.nodeID, r.addr, r.now(), r.ttl)
+	if err != nil {
+		// The store did not answer, so we do NOT know we lost the room. Keep the materialized copy
+		// and surface the failure as itself: returning ErrNotOwner here would tell the gateway to
+		// go find the "real" owner, turning a coord brownout into a re-home storm aimed at the
+		// store that is already failing. Ambiguity freezes.
+		return fmt.Errorf("coord claim %q: %w", roomID, err)
+	}
+	if !ok {
 		delete(r.rooms, roomID) // we no longer own it; don't serve from a stale copy
 		delete(r.owned, roomID)
 		return ErrNotOwner

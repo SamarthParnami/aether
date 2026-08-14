@@ -20,7 +20,10 @@
 // clock; only the expiry comparisons here use these wall-clock instants.
 package coord
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 // Lease is a time-bound ownership token for a room.
 type Lease struct {
@@ -31,6 +34,14 @@ type Lease struct {
 }
 
 // Coordinator manages room ownership and answers the directory lookup.
+//
+// Every method takes a ctx and returns an error, and the bool and the error are INDEPENDENT: the
+// bool is what the store said (held / not held), the error is that the store did not answer at
+// all. A durable adapter must never fold the second into the first — a DynamoDB throttle or a
+// timeout rendered as "not held" is indistinguishable from "this room is unowned", and routing
+// reads "unowned" as an invitation to place the room somewhere. That would aim a claim storm at a
+// store already failing. Callers check err FIRST and freeze on ambiguity; only a nil error makes
+// the bool meaningful (01-design-backbone.md:240).
 type Coordinator interface {
 	// Claim attempts to acquire roomID for owner, publishing owner's dialable RPC address (addr)
 	// atomically with the claim — so the directory never names an owner the gateway can't reach
@@ -38,18 +49,23 @@ type Coordinator interface {
 	// has expired, or owner already holds it. A takeover (acquiring a free/expired lease) bumps the
 	// fencing token; a re-claim by the current holder keeps it and re-affirms addr. Returns the
 	// granted lease and true, or a zero lease and false when another node holds an unexpired lease.
-	Claim(roomID, owner, addr string, now time.Time, ttl time.Duration) (Lease, bool)
+	// A non-nil error means the claim's outcome is UNKNOWN — the caller has not lost the room and
+	// must not drop it; it must not treat the false as "another node owns this".
+	Claim(ctx context.Context, roomID, owner, addr string, now time.Time, ttl time.Duration) (Lease, bool, error)
 
 	// Renew extends owner's lease. Returns false (ownership lost) if owner is not the
 	// current unexpired holder.
-	Renew(roomID, owner string, now time.Time, ttl time.Duration) (Lease, bool)
+	Renew(ctx context.Context, roomID, owner string, now time.Time, ttl time.Duration) (Lease, bool, error)
 
 	// Release relinquishes ownership if owner holds it — a graceful handoff on shutdown,
-	// so a survivor can claim immediately instead of waiting out the TTL.
-	Release(roomID, owner string)
+	// so a survivor can claim immediately instead of waiting out the TTL. An error means the
+	// release may not have landed: the lease then lapses on its own TTL, which is the slow path
+	// Release exists to avoid, so callers should surface it rather than discard it.
+	Release(ctx context.Context, roomID, owner string) error
 
 	// Current returns the unexpired lease for a room: the directory lookup gateways use to
 	// route, including the owner's Addr. Returns false if the room is unowned or its lease has
-	// lapsed.
-	Current(roomID string, now time.Time) (Lease, bool)
+	// lapsed. A non-nil error means the directory could not be read — NOT that the room is
+	// unowned. This is the distinction the whole interface change exists to make.
+	Current(ctx context.Context, roomID string, now time.Time) (Lease, bool, error)
 }

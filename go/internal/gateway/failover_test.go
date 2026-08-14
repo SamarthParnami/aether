@@ -59,7 +59,9 @@ func TestRelayRecoversAfterFailover(t *testing.T) {
 	}
 
 	// Failover: A hands off and dies; B takes over with a post-failover commit (same shared log).
-	a.Release("room")
+	if err := a.Release(bg, "room"); err != nil {
+		t.Fatalf("A Release: %v", err)
+	}
 	stopA()
 	if _, applied, err := b.Commit(bg, "room", "x", 3, kvBody("k", "3")); err != nil || !applied {
 		t.Fatalf("B failover commit: applied=%v err=%v", applied, err)

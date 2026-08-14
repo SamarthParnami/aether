@@ -1,7 +1,9 @@
 package gateway
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"sync"
 	"time"
@@ -18,6 +20,19 @@ import (
 // failure — turning a momentary gap or a node that forgot WithAddr into a fast re-resolve rather
 // than a silent black hole.
 var ErrNoOwner = errors.New("gateway: no reachable owner for room")
+
+// ErrDirectoryUnavailable is returned by Owner when the coord directory could not be READ at all —
+// the store timed out, throttled, or otherwise failed to answer. It is deliberately distinct from
+// ErrNoOwner: ErrNoOwner is a definite answer ("no live lease"), this one is the absence of an
+// answer ("we do not know").
+//
+// Nothing branches on the difference yet — both callers freeze identically today, which is why
+// this PR is a no-op at runtime. It exists because the placement work is about to make the
+// difference load-bearing: a resolve that cannot read the directory must NOT fall through to
+// choosing a node by hash, or a coord brownout becomes a fleet-wide claim storm aimed at the store
+// that is already failing (07-design-placement.md §4.1). Ambiguity freezes; only a definite
+// ErrNoOwner may ever authorize placement.
+var ErrDirectoryUnavailable = errors.New("gateway: room directory unavailable")
 
 // OwnerLocator resolves a room to its current owner's RoomService client via the coord directory,
 // pooling one Connect client per owner address. Owner addresses are dialed as host:port over HTTP.
@@ -71,8 +86,16 @@ func NewOwnerLocator(co coord.Coordinator, opts ...LocatorOption) *OwnerLocator 
 // ErrNoOwner when there is no reachable owner — no live lease, or a non-routable (empty Addr) one.
 // The caller passes the returned address back to Invalidate after a dial/transport failure so the
 // dead client is dropped and the next Owner re-creates against the live (possibly re-homed) owner.
-func (l *OwnerLocator) Owner(roomID string) (aetherv1connect.RoomServiceClient, string, error) {
-	lease, ok := l.coord.Current(roomID, l.now())
+//
+// If the directory itself cannot be read it returns ErrDirectoryUnavailable wrapping the store's
+// error — never ErrNoOwner, which would claim a room is unowned on no evidence.
+func (l *OwnerLocator) Owner(
+	ctx context.Context, roomID string,
+) (aetherv1connect.RoomServiceClient, string, error) {
+	lease, ok, err := l.coord.Current(ctx, roomID, l.now())
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: %w", ErrDirectoryUnavailable, err)
+	}
 	if !ok || lease.Addr == "" {
 		return nil, "", ErrNoOwner
 	}

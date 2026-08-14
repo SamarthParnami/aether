@@ -55,7 +55,7 @@ func TestReadLoopStaysResponsiveDuringSlowOp(t *testing.T) {
 	defer func() { _ = srv.Close() }()
 
 	co := coord.NewMemory()
-	co.Claim("room", "slow", ln.Addr().String(), time.Now(), time.Minute)
+	mustClaim(t, co, "room", "slow", ln.Addr().String(), time.Now(), time.Minute)
 
 	gw := httptest.NewServer(gateway.NewServer(
 		gateway.DevAuthenticator{Header: authHeader},

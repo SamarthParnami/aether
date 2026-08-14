@@ -28,7 +28,7 @@ func (r *Runtime) Broadcast(
 	}
 
 	r.mu.Lock()
-	err := r.acquire(roomID)
+	err := r.acquire(ctx, roomID)
 	r.mu.Unlock()
 	if err != nil {
 		return err
@@ -65,7 +65,7 @@ func (r *Runtime) TailEphemeral(
 	ctx context.Context, roomID string, send func(*aetherv1.Ephemeral) error,
 ) error {
 	r.mu.Lock()
-	err := r.acquire(roomID)
+	err := r.acquire(ctx, roomID)
 	r.mu.Unlock()
 	if err != nil {
 		return err
