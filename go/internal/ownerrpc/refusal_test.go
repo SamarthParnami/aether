@@ -2,6 +2,7 @@ package ownerrpc_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"connectrpc.com/connect"
@@ -9,6 +10,7 @@ import (
 	aetherv1 "github.com/SamarthParnami/aether/go/gen/aether/v1"
 	"github.com/SamarthParnami/aether/go/gen/aether/v1/aetherv1connect"
 	"github.com/SamarthParnami/aether/go/internal/coord"
+	"github.com/SamarthParnami/aether/go/internal/coord/coordtest"
 	"github.com/SamarthParnami/aether/go/internal/fanout"
 	"github.com/SamarthParnami/aether/go/internal/logstore"
 	"github.com/SamarthParnami/aether/go/internal/roomruntime"
@@ -100,6 +102,25 @@ func TestNotOwnerIsStillFailedPreconditionOnEveryRPC(t *testing.T) {
 	for name, err := range callEachRPC(ctx, client, "room") {
 		if got := connect.CodeOf(err); got != connect.CodeFailedPrecondition {
 			t.Errorf("%s on a non-owner = %v (err=%v), want FailedPrecondition", name, got, err)
+		}
+	}
+}
+
+// A coordinator that did not answer is UNAVAILABLE — transient and retryable — not INTERNAL, which
+// asserts a bug. #51 made that distinction available at the coord interface; without a sentinel it
+// is lost one layer up and every store brownout reaches clients as an internal error, which gRPC
+// and Connect retry policies treat quite differently.
+func TestCoordUnavailableIsUnavailableOnEveryRPC(t *testing.T) {
+	ctx := context.Background()
+	co := coordtest.New(coord.NewMemory())
+	rt := roomruntime.New(logstore.NewMemory(), fanout.NewMemory(), roomruntime.WithCoordinator(co))
+	client := newClient(t, rt)
+
+	co.FailClaim(errors.New("dynamodb: throttled"))
+
+	for name, err := range callEachRPC(ctx, client, "room") {
+		if got := connect.CodeOf(err); got != connect.CodeUnavailable {
+			t.Errorf("%s during a coord brownout = %v (err=%v), want Unavailable", name, got, err)
 		}
 	}
 }

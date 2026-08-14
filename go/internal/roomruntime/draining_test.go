@@ -3,6 +3,7 @@ package roomruntime_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -200,5 +201,91 @@ func TestMaxRoomsZeroIsUnlimited(t *testing.T) {
 		if _, applied, err := rt.Commit(ctx, room, "x", 1, kvBody("k", "v")); err != nil || !applied {
 			t.Fatalf("%s commit: applied=%v err=%v", room, applied, err)
 		}
+	}
+}
+
+// The capacity cap must count rooms this node CURRENTLY owns, not rooms it has ever touched.
+//
+// owned is only pruned by an explicit Release or a lost Claim, so a lease that lapses from
+// inactivity leaves its entry behind. As a lifetime counter the knob does not bound concurrent load
+// at all — it bounds how long a pod may stay up. For this product that is the normal case rather
+// than a corner: rooms are classes, classes end, and nothing releases them when they do. A node
+// configured for 500 rooms would serve 500 classes one after another, never more than one at a
+// time, then refuse everything permanently while holding zero live leases — a silent failure that
+// arrives a week late.
+func TestMaxRoomsCountsLiveLeasesNotLifetime(t *testing.T) {
+	ctx := context.Background()
+	co := coord.NewMemory()
+	clk := &fakeClock{t: time.Unix(1000, 0)}
+	rt := roomruntime.New(logstore.NewMemory(), fanout.NewMemory(),
+		roomruntime.WithNodeID("A"),
+		roomruntime.WithAddr("a.example:7001"),
+		roomruntime.WithCoordinator(co),
+		roomruntime.WithClock(clk.now),
+		roomruntime.WithLeaseTTL(testTTL),
+		roomruntime.WithMaxRooms(2),
+	)
+
+	// Serve rooms strictly one after another, letting each lease lapse before the next. Concurrency
+	// never exceeds one, so a cap of 2 must never be reached.
+	for i := range 8 {
+		room := fmt.Sprintf("class-%d", i)
+		if _, applied, err := rt.Commit(ctx, room, "x", 1, kvBody("k", "v")); err != nil || !applied {
+			t.Fatalf("%s (room %d served sequentially, cap=2): applied=%v err=%v — the cap is "+
+				"counting rooms ever owned rather than rooms owned now", room, i+1, applied, err)
+		}
+		clk.advance(testTTL + time.Second) // the lease lapses; the room is over
+	}
+}
+
+// The cap still binds on CONCURRENT rooms, so the fix above cannot be satisfied by never refusing.
+func TestMaxRoomsStillBindsWhileLeasesAreLive(t *testing.T) {
+	ctx := context.Background()
+	co := coord.NewMemory()
+	clk := &fakeClock{t: time.Unix(1000, 0)}
+	rt := roomruntime.New(logstore.NewMemory(), fanout.NewMemory(),
+		roomruntime.WithNodeID("A"),
+		roomruntime.WithAddr("a.example:7001"),
+		roomruntime.WithCoordinator(co),
+		roomruntime.WithClock(clk.now),
+		roomruntime.WithLeaseTTL(testTTL),
+		roomruntime.WithMaxRooms(2),
+	)
+
+	for _, room := range []string{"room-1", "room-2"} {
+		if _, applied, err := rt.Commit(ctx, room, "x", 1, kvBody("k", "v")); err != nil || !applied {
+			t.Fatalf("%s commit: applied=%v err=%v", room, applied, err)
+		}
+		clk.advance(time.Second) // well inside the TTL: both leases stay live
+	}
+
+	if _, _, err := rt.Commit(ctx, "room-3", "x", 1, kvBody("k", "v")); !errors.Is(err, roomruntime.ErrAtCapacity) {
+		t.Fatalf("third concurrent room = %v, want ErrAtCapacity", err)
+	}
+}
+
+// A lapsed lease is not ownership, so a draining node must not treat it as a room it already holds
+// and quietly re-take it.
+func TestDrainingRefusesARoomWhoseLeaseLapsed(t *testing.T) {
+	ctx := context.Background()
+	co := coord.NewMemory()
+	clk := &fakeClock{t: time.Unix(1000, 0)}
+	rt := roomruntime.New(logstore.NewMemory(), fanout.NewMemory(),
+		roomruntime.WithNodeID("A"),
+		roomruntime.WithAddr("a.example:7001"),
+		roomruntime.WithCoordinator(co),
+		roomruntime.WithClock(clk.now),
+		roomruntime.WithLeaseTTL(testTTL),
+	)
+
+	if _, applied, err := rt.Commit(ctx, "room", "x", 1, kvBody("k", "v")); err != nil || !applied {
+		t.Fatalf("warm-up commit: applied=%v err=%v", applied, err)
+	}
+	clk.advance(testTTL + time.Second) // the lease lapses on its own
+	rt.SetDraining(true)
+
+	if _, _, err := rt.Commit(ctx, "room", "x", 2, kvBody("k", "v2")); !errors.Is(err, roomruntime.ErrDraining) {
+		t.Fatalf("commit to a lapsed room while draining = %v, want ErrDraining — a lapsed lease "+
+			"is not ownership, so the admission gate must apply", err)
 	}
 }

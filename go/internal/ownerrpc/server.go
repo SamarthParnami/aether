@@ -9,6 +9,8 @@
 //   - RESOURCE_EXHAUSTED: this node COULD own the room and is refusing it (draining, or at its room
 //     cap). Re-resolving would be useless — the directory has nothing new to say — so the gateway
 //     must try a different node instead. Kept distinct precisely because the recovery differs.
+//   - UNAVAILABLE: the coordinator did not answer, so ownership is unknown. Transient and
+//     retryable, as against INTERNAL, which asserts a bug.
 package ownerrpc
 
 import (
@@ -44,6 +46,11 @@ func routingError(err error) *connect.Error {
 	case errors.Is(err, roomruntime.ErrDraining), errors.Is(err, roomruntime.ErrAtCapacity):
 		// Right node, refused. The directory would just send the caller back here.
 		return connect.NewError(connect.CodeResourceExhausted, err)
+	case errors.Is(err, roomruntime.ErrCoordUnavailable):
+		// The store did not answer, so ownership is unknown. UNAVAILABLE (transient, retryable),
+		// never INTERNAL — clients and gRPC retry policy treat those differently, and INTERNAL
+		// asserts "this is a bug" about what is usually a brownout that clears itself.
+		return connect.NewError(connect.CodeUnavailable, err)
 	}
 	return nil
 }

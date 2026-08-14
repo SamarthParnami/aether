@@ -53,6 +53,13 @@ const defaultTailPollInterval = 3 * time.Second
 // or retry after the lease lapses; it must not treat the operation as applied.
 var ErrNotOwner = errors.New("roomruntime: not the room owner")
 
+// ErrCoordUnavailable wraps a failure to READ OR WRITE the coordinator — the store did not answer,
+// so ownership is unknown (see coord.Coordinator). It exists so the RPC layer can render it as
+// UNAVAILABLE (transient, retryable) rather than INTERNAL (a bug): #51 made the distinction
+// available at the coord interface, and without a sentinel it is lost again one layer up, leaving
+// every store brownout reported to clients as an internal error.
+var ErrCoordUnavailable = errors.New("roomruntime: coordinator unavailable")
+
 // ErrDraining and ErrAtCapacity are REFUSALS, not ownership verdicts: this node could serve the
 // room and is choosing not to. They are distinct from ErrNotOwner because the caller must do
 // something different with them — ErrNotOwner says "go find the owner", these say "go find ANOTHER
@@ -93,10 +100,17 @@ type Runtime struct {
 	mu    sync.Mutex
 	rooms map[string]*roomcore.Room
 
-	// owned is the set of rooms whose lease this node currently holds. It is NOT the same as
+	// owned maps a room to the EXPIRY of the lease this node holds on it. It is NOT the same as
 	// rooms: a conflicted append drops the in-memory room while the lease may still be held, so
 	// tracking ownership separately is what lets Shutdown release everything it actually owns.
-	owned map[string]struct{}
+	//
+	// The expiry, rather than a bare set, is what makes it mean "currently owns". Entries are only
+	// removed by an explicit Release or a lost Claim, so a lease that simply LAPSES from inactivity
+	// leaves its entry behind — harmless while the map was only a release list, and wrong the
+	// moment WithMaxRooms counts it. Rooms are classes and classes end, so on a lifetime counter a
+	// node serving 500 rooms one after another (never more than one at a time) would refuse
+	// everything afterwards, permanently, holding zero live leases.
+	owned map[string]time.Time
 	// closed is set by Shutdown. It makes acquire refuse, which is load-bearing: acquire CLAIMS,
 	// so without it any request still in flight would instantly re-take a room we just released.
 	closed bool
@@ -174,7 +188,7 @@ func New(log logstore.LogStore, fo fanout.Fanout, opts ...Option) *Runtime {
 		ttl:      defaultLeaseTTL,
 		tailPoll: defaultTailPollInterval,
 		rooms:    map[string]*roomcore.Room{},
-		owned:    map[string]struct{}{},
+		owned:    map[string]time.Time{},
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -363,16 +377,41 @@ func (r *Runtime) releaseLocked(ctx context.Context, roomID string) error {
 	delete(r.rooms, roomID)
 	delete(r.owned, roomID)
 	if err != nil {
-		return fmt.Errorf("coord release %q: %w", roomID, err)
+		return fmt.Errorf("%w: release %q: %w", ErrCoordUnavailable, roomID, err)
 	}
 	return nil
+}
+
+// holdsLocked reports whether this node holds a LIVE lease on the room. A lapsed entry is not
+// ownership: the room is free for anyone, including a draining node that must not take it back.
+// Caller must hold r.mu.
+func (r *Runtime) holdsLocked(roomID string, now time.Time) bool {
+	expiry, ok := r.owned[roomID]
+	return ok && now.Before(expiry)
+}
+
+// pruneOwnedLocked drops rooms whose lease has lapsed and returns how many remain — the count of
+// rooms this node ACTUALLY owns right now, which is what a capacity cap has to be measured against.
+//
+// Pruning here rather than on a timer is deliberate: it runs only on the admission path, and only
+// when a cap is configured, so a node without WithMaxRooms pays nothing. A lapsed lease needs no
+// Release either, so dropping the entry loses nothing Shutdown would have done.
+// Caller must hold r.mu.
+func (r *Runtime) pruneOwnedLocked(now time.Time) int {
+	for roomID, expiry := range r.owned {
+		if !now.Before(expiry) {
+			delete(r.owned, roomID)
+		}
+	}
+	return len(r.owned)
 }
 
 // acquire confirms this node holds the room's ownership lease, claiming it if the room is free
 // or expired and renewing it if already held. On failure another node is the live owner: the
 // stale in-memory room is dropped and ErrNotOwner returned. Caller must hold r.mu.
 //
-// The granted Lease (and its fencing Token) is intentionally discarded: in Phase 1 the only
+// The granted Lease's EXPIRY is recorded in owned (a capacity cap has to count live leases, not
+// rooms ever touched). Its fencing Token is still intentionally discarded: in Phase 1 the only
 // thing fenced is the durable write, and that is fenced by the room_seq conditional Append, not
 // the token — so the token is not load-bearing here. The token's eventual job is fencing the
 // one durable write NOT conditioned on room_seq, logstore.WriteSnapshot (today an unconditional
@@ -388,28 +427,29 @@ func (r *Runtime) acquire(ctx context.Context, roomID string) error {
 	// never refused: draining hands rooms over one at a time (a blanket refusal would cut every live
 	// session the moment preStop fired), and a capacity cap declines new work rather than evicting
 	// existing work.
-	if _, held := r.owned[roomID]; !held {
+	now := r.now()
+	if !r.holdsLocked(roomID, now) {
 		if r.draining {
 			return ErrDraining
 		}
-		if r.maxRooms > 0 && len(r.owned) >= r.maxRooms {
+		if r.maxRooms > 0 && r.pruneOwnedLocked(now) >= r.maxRooms {
 			return ErrAtCapacity
 		}
 	}
-	_, ok, err := r.coord.Claim(ctx, roomID, r.nodeID, r.addr, r.now(), r.ttl)
+	lease, ok, err := r.coord.Claim(ctx, roomID, r.nodeID, r.addr, now, r.ttl)
 	if err != nil {
 		// The store did not answer, so we do NOT know we lost the room. Keep the materialized copy
 		// and surface the failure as itself: returning ErrNotOwner here would tell the gateway to
 		// go find the "real" owner, turning a coord brownout into a re-home storm aimed at the
 		// store that is already failing. Ambiguity freezes.
-		return fmt.Errorf("coord claim %q: %w", roomID, err)
+		return fmt.Errorf("%w: claim %q: %w", ErrCoordUnavailable, roomID, err)
 	}
 	if !ok {
 		delete(r.rooms, roomID) // we no longer own it; don't serve from a stale copy
 		delete(r.owned, roomID)
 		return ErrNotOwner
 	}
-	r.owned[roomID] = struct{}{}
+	r.owned[roomID] = lease.Expiry
 	return nil
 }
 
