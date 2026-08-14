@@ -273,7 +273,16 @@ func (r *Runtime) Join(ctx context.Context, roomID string) (*aetherv1.Joined, er
 //
 // The preStop ORDER is load-bearing and silently wrong if reversed:
 //
-//	Deregister → wait 2× view refresh → SetDraining(true) → Release each room → exit
+//	stop the heartbeat loop → Deregister → wait 2× view refresh → SetDraining(true) →
+//	  Release each room → exit
+//
+// Stopping the heartbeat loop FIRST is not obvious and is easy to omit. membership.Memory revives
+// a deregistered node on its next heartbeat — deliberately, so an aborted drain needs no operator
+// intervention — and it cannot tell that case apart from a heartbeat loop that simply has not been
+// stopped. Since Deregister is mandated to run while the node is still serving, such a heartbeat is
+// in flight by construction, and the drain silently un-drains: Deregister returns nil, one View
+// shows the node gone, and moments later it is back taking placements while it exits. See
+// membership.Registry.Deregister — the structural fix belongs there, not here.
 //
 // Deregistering first is what makes the drain converge. Because a node is gateway + owner in one
 // binary, a gateway holding a slightly stale fleet view can still rank this pod first — and if the
