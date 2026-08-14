@@ -25,6 +25,10 @@ import (
 // checks the bool before the error will read "unowned" and take the wrong branch. Tests that pass
 // against this decorator are tests that check the error first.
 //
+// PRECEDENCE: a cancelled ctx wins over an armed fault. Arming FailClaim(errBoom) and passing a
+// dead context yields context.Canceled, not errBoom — the same order a real adapter would apply,
+// and worth knowing before discovering it from a failing assertion.
+//
 // Safe for concurrent use — the gateway suite runs under -race with the relay resolving from its
 // own goroutine.
 type Faulty struct {
