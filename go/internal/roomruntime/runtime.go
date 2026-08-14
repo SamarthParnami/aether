@@ -164,7 +164,10 @@ func WithLeaseTTL(ttl time.Duration) Option { return func(r *Runtime) { r.ttl = 
 
 // WithMaxRooms caps the number of rooms this node will own at once; beyond it, acquiring a NEW room
 // returns ErrAtCapacity while rooms already owned keep being served. Zero (the default) is
-// unlimited, which is the Phase-1 behaviour.
+// unlimited, which is the Phase-1 behaviour, and so is any NEGATIVE n — the gate is "n > 0", so a
+// computed cap that comes out below zero disables the cap rather than refusing everything. Stated
+// because refusing everything is the other plausible reading, and WithTailPollInterval documents
+// its own non-positive case.
 //
 // This is the only backpressure a node has against placement. The placement function distributes by
 // hash, which knows nothing about load — so a room that is unusually expensive, or a fleet that has

@@ -428,3 +428,17 @@ func TestDrainDoesNotCutEstablishedReaders(t *testing.T) {
 	default:
 	}
 }
+
+// A negative cap is unlimited, not "refuse everything" — the gate is n > 0. Pinned because a
+// computed cap (capacity minus reserved, say) can come out negative, and the other reading would
+// take the node out of service silently.
+func TestMaxRoomsNegativeIsUnlimited(t *testing.T) {
+	ctx := context.Background()
+	rt, _ := node(t, roomruntime.WithMaxRooms(-1))
+
+	for _, room := range []string{"r1", "r2", "r3"} {
+		if _, applied, err := rt.Commit(ctx, room, "x", 1, kvBody("k", "v")); err != nil || !applied {
+			t.Fatalf("%s commit with a negative cap: applied=%v err=%v", room, applied, err)
+		}
+	}
+}

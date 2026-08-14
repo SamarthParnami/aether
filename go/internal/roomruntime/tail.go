@@ -54,8 +54,22 @@ func (r *Runtime) Tail(
 	defer sub.Cancel()
 
 	// A poll tick re-reads the log even with no wake, bounding read staleness if this node isn't
-	// the one being woken (a re-home moved commits to another node's fan-out). It also RE-ACQUIRES
-	// (see the tick branch below).
+	// the one being woken (a re-home moved commits to another node's fan-out). It also RENEWS the
+	// lease (see the tick branch below).
+	//
+	// NOT SIM-DRIVABLE, and this is the one timer in the package that isn't. WithClock injects
+	// r.now, which time.NewTicker does not consult, so the DST harness cannot drive this loop —
+	// which now matters more than it used to, because the renewal below decides whether a room held
+	// only by readers keeps its lease. Every test of that has to sleep through real intervals, and
+	// sleep-based timing tests go intermittent on a loaded box, where the natural response is to
+	// raise the sleep rather than to notice the seam is missing.
+	//
+	// Deliberately not fixed here: the queued per-room renewal loop moves renewal OFF this tick
+	// entirely, so the timer that needs to be injectable is that loop's, not this one. Doing it now
+	// would build the seam around a caller about to move. (A seam does work: an injected
+	// func(time.Duration) *time.Ticker fakes fine, since &time.Ticker{C: ch} accepts Stop on
+	// go1.26 — though that constructs a Ticker outside NewTicker, which the docs do not promise, so
+	// a channel-plus-stop-func signature is the safer shape.)
 	ticker := time.NewTicker(r.tailPoll)
 	defer ticker.Stop()
 
