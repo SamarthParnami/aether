@@ -48,9 +48,9 @@ func TestRelayRecoversAfterFailover(t *testing.T) {
 		t.Fatalf("joined = %v, want current_seq 1", joined)
 	}
 
-	// Warm up the relay: deliver one live event so its Tail has definitely subscribed (and thus
-	// acquired A's lease) BEFORE the handoff. Otherwise Release could race the relay's claim-on-serve
-	// Tail re-acquiring A's lease afterwards, leaving A the owner so B can't take over.
+	// Deliver one live event so the relay's Tail has definitely subscribed to A before the handoff.
+	// This is what makes the test exercise RE-subscription rather than a first subscription that
+	// happens to land on B — it is setup, not a workaround, so it stays.
 	if _, applied, err := a.Commit(bg, "room", "x", 2, kvBody("k", "2")); err != nil || !applied {
 		t.Fatalf("A warm-up commit: applied=%v err=%v", applied, err)
 	}
@@ -59,6 +59,12 @@ func TestRelayRecoversAfterFailover(t *testing.T) {
 	}
 
 	// Failover: A hands off and dies; B takes over with a post-failover commit (same shared log).
+	//
+	// Draining before releasing is the real fix for the re-acquire race this test used to dodge by
+	// timing alone: Release hands the room back, but A's relay Tail is still running and its
+	// claim-on-serve would re-take the lease, leaving A the owner so B could never win. A draining
+	// node refuses to re-acquire, which is exactly the ordering preStop uses.
+	a.SetDraining(true)
 	if err := a.Release(bg, "room"); err != nil {
 		t.Fatalf("A Release: %v", err)
 	}

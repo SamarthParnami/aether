@@ -36,7 +36,15 @@ import (
 )
 
 // defaultLeaseTTL is the lease lifetime used when WithLeaseTTL is not supplied. It must be
-// comfortably larger than the (later) renewal interval and the max inter-node clock skew.
+// comfortably larger than the renewal interval (defaultTailPollInterval, which is what renews a
+// read-held room) and the max inter-node clock skew.
+//
+// 01-design-backbone.md §6.4 specifies "renew ~2s, expire ~6s"; these are 3s/10s. The trade is a
+// slower failover floor bought for DOUBLE THE ABSOLUTE SLACK after a missed renewal — TTL minus two
+// renewal intervals is 4s here against §6.4's 2s — which is what matters, because GC pauses and
+// clock skew consume absolute time, not a fraction of the TTL. (The renew-to-expiry ratio is
+// incidentally slightly lower, 0.30 against 0.33; it is not the quantity doing the work.) Noted
+// because §6.4's numbers are the ones a reader will check this constraint against.
 const defaultLeaseTTL = 10 * time.Second
 
 // defaultTailPollInterval is the coarse backstop at which Tail re-reads the durable log even with
@@ -52,6 +60,33 @@ const defaultTailPollInterval = 3 * time.Second
 // lease — another node is the live owner. The caller (gateway) should route to the real owner
 // or retry after the lease lapses; it must not treat the operation as applied.
 var ErrNotOwner = errors.New("roomruntime: not the room owner")
+
+// ErrCoordUnavailable wraps a failure to READ OR WRITE the coordinator — the store did not answer,
+// so ownership is unknown (see coord.Coordinator). It exists so the RPC layer can render it as
+// UNAVAILABLE (transient, retryable) rather than INTERNAL (a bug): #51 made the distinction
+// available at the coord interface, and without a sentinel it is lost again one layer up, leaving
+// every store brownout reported to clients as an internal error.
+var ErrCoordUnavailable = errors.New("roomruntime: coordinator unavailable")
+
+// ErrDraining and ErrAtCapacity are REFUSALS, not ownership verdicts: this node could serve the
+// room and is choosing not to. They are distinct from ErrNotOwner because the caller must do
+// something different with them — ErrNotOwner says "go find the owner", these say "go find ANOTHER
+// node", and once placement exists that means advancing to the next-ranked candidate rather than
+// re-resolving the directory and arriving back here.
+//
+// Both gate ADMISSION only. A room this node already owns keeps being served until it is explicitly
+// Released, or draining would cut live sessions the instant preStop fired instead of handing them
+// over, and a capacity limit would evict rooms rather than decline new ones.
+var (
+	// ErrDraining is returned when this node is shutting down and no longer accepts new rooms. Set
+	// by preStop BEFORE the rooms are released — the ordering is load-bearing (see SetDraining).
+	ErrDraining = errors.New("roomruntime: node is draining")
+
+	// ErrAtCapacity is returned when this node already owns WithMaxRooms rooms. A genuine
+	// load-shedding valve: without it the placement function's opinion is the only thing bounding a
+	// node's room count, and a hash is not aware of load.
+	ErrAtCapacity = errors.New("roomruntime: node is at room capacity")
+)
 
 // Runtime owns a set of rooms on this node. Ownership is enforced per room via the coord
 // lease; a Runtime serves only rooms whose lease it currently holds.
@@ -73,13 +108,25 @@ type Runtime struct {
 	mu    sync.Mutex
 	rooms map[string]*roomcore.Room
 
-	// owned is the set of rooms whose lease this node currently holds. It is NOT the same as
+	// owned maps a room to the EXPIRY of the lease this node holds on it. It is NOT the same as
 	// rooms: a conflicted append drops the in-memory room while the lease may still be held, so
 	// tracking ownership separately is what lets Shutdown release everything it actually owns.
-	owned map[string]struct{}
+	//
+	// The expiry, rather than a bare set, is what makes it mean "currently owns". Entries are only
+	// removed by an explicit Release or a lost Claim, so a lease that simply LAPSES from inactivity
+	// leaves its entry behind — harmless while the map was only a release list, and wrong the
+	// moment WithMaxRooms counts it. Rooms are classes and classes end, so on a lifetime counter a
+	// node serving 500 rooms one after another (never more than one at a time) would refuse
+	// everything afterwards, permanently, holding zero live leases.
+	owned map[string]time.Time
 	// closed is set by Shutdown. It makes acquire refuse, which is load-bearing: acquire CLAIMS,
 	// so without it any request still in flight would instantly re-take a room we just released.
 	closed bool
+	// draining is set by SetDraining (preStop). Unlike closed it is reversible and refuses only NEW
+	// rooms, so a node keeps serving what it owns while it hands them over one at a time.
+	draining bool
+	// maxRooms caps how many rooms this node will take on; 0 means unlimited.
+	maxRooms int
 }
 
 // Option configures a Runtime. Unset options fall back to single-node defaults: a private
@@ -115,6 +162,18 @@ func WithClock(now func() time.Time) Option { return func(r *Runtime) { r.now = 
 // WithLeaseTTL sets the lease lifetime acquired on each claim/renew.
 func WithLeaseTTL(ttl time.Duration) Option { return func(r *Runtime) { r.ttl = ttl } }
 
+// WithMaxRooms caps the number of rooms this node will own at once; beyond it, acquiring a NEW room
+// returns ErrAtCapacity while rooms already owned keep being served. Zero (the default) is
+// unlimited, which is the Phase-1 behaviour, and so is any NEGATIVE n — the gate is "n > 0", so a
+// computed cap that comes out below zero disables the cap rather than refusing everything. Stated
+// because refusing everything is the other plausible reading, and WithTailPollInterval documents
+// its own non-positive case.
+//
+// This is the only backpressure a node has against placement. The placement function distributes by
+// hash, which knows nothing about load — so a room that is unusually expensive, or a fleet that has
+// just lost half its nodes, would otherwise pile onto whoever the hash names with no way to say no.
+func WithMaxRooms(n int) Option { return func(r *Runtime) { r.maxRooms = n } }
+
 // WithTailPollInterval sets how often Tail re-reads the log absent a fan-out wakeup — the bound on
 // read staleness when the room is served by a node that isn't being woken (e.g. after a re-home).
 // Defaults to defaultTailPollInterval. A non-positive d is IGNORED: the poll is the correctness
@@ -140,7 +199,7 @@ func New(log logstore.LogStore, fo fanout.Fanout, opts ...Option) *Runtime {
 		ttl:      defaultLeaseTTL,
 		tailPoll: defaultTailPollInterval,
 		rooms:    map[string]*roomcore.Room{},
-		owned:    map[string]struct{}{},
+		owned:    map[string]time.Time{},
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -230,6 +289,36 @@ func (r *Runtime) Join(ctx context.Context, roomID string) (*aetherv1.Joined, er
 	}, nil
 }
 
+// SetDraining marks this node as accepting no NEW rooms (or clears that). Rooms already owned are
+// unaffected and keep being served until Released, so a drain is a handover rather than a cut.
+//
+// Reversible on purpose, unlike Shutdown's closed: a preStop that is cancelled (a rolling deploy
+// aborted, a failed health check that recovers) must be able to put the node back into service
+// without restarting it.
+//
+// The preStop ORDER is load-bearing and silently wrong if reversed:
+//
+//	stop the heartbeat loop → Deregister → wait 2× view refresh → SetDraining(true) →
+//	  Release each room → exit
+//
+// Stopping the heartbeat loop FIRST is not obvious and is easy to omit. membership.Memory revives
+// a deregistered node on its next heartbeat — deliberately, so an aborted drain needs no operator
+// intervention — and it cannot tell that case apart from a heartbeat loop that simply has not been
+// stopped. Since Deregister is mandated to run while the node is still serving, such a heartbeat is
+// in flight by construction, and the drain silently un-drains: Deregister returns nil, one View
+// shows the node gone, and moments later it is back taking placements while it exits. See
+// membership.Registry.Deregister — the structural fix belongs there, not here.
+//
+// Deregistering first is what makes the drain converge. Because a node is gateway + owner in one
+// binary, a gateway holding a slightly stale fleet view can still rank this pod first — and if the
+// rooms were released before the view caught up, that gateway would place them straight back onto
+// the pod that is exiting. The wait covers the staleness; draining covers whatever slips through it.
+func (r *Runtime) SetDraining(draining bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.draining = draining
+}
+
 // Release gracefully relinquishes ownership of a room (e.g. on a planned shutdown) so a
 // survivor can take over immediately instead of waiting out the lease TTL. The in-memory room
 // is dropped; a later request re-homes it (re-claiming if the room is still free).
@@ -259,9 +348,25 @@ func (r *Runtime) Release(ctx context.Context, roomID string) error {
 //
 // SCOPE: this releases leases. It does NOT tear down in-flight Tail/Subscribe streams — those end
 // when the RPC server's context is cancelled (http.Server.Shutdown), which is the binary's job and
-// lands with cmd/. A gateway whose stream outlives the release keeps reading an owner that no
-// longer owns the room until the stream dies, so the two must be sequenced together at the call
-// site: stop the RPC server, then Shutdown the runtime.
+// lands with cmd/.
+//
+// UNRESOLVED, and P9 must settle it rather than inherit it. The note here used to say the two are
+// sequenced "stop the RPC server, then Shutdown the runtime", on the grounds that a stream
+// outliving the release keeps reading from a node that no longer owns the room. That justification
+// now contradicts the one Tail's renewal relies on: a reader may outlive the release and stay
+// correct, because reads come from the shared log rather than from ownership
+// (TestTailPollSurvivesReHome). Both orderings have a cost:
+//
+//   - server first: leases are still held when the server stops, so every disconnected gateway
+//     re-resolves onto a directory still naming this pod, dials a dead address and backs off until
+//     Release lands or the TTL lapses — a reconnect storm aimed at a node that is already gone;
+//   - release first: gateways that re-resolve land on a live new owner, and existing readers keep
+//     working off the shared log until the pod actually dies.
+//
+// Either way nothing ends reader streams DURING the drain, so they all disconnect at once when the
+// process exits — a synchronised reconnect for every reader on the node, which is the shape of
+// event a drain exists to avoid. Staggering it needs something to cancel per-room stream contexts
+// once ownership has moved, which Runtime does not track today.
 // Every room is attempted even if one release fails; the failures are joined and returned, so a
 // single unreachable-store room cannot strand the rest of the node's leases.
 //
@@ -279,6 +384,10 @@ func (r *Runtime) Shutdown(ctx context.Context) error {
 	defer r.mu.Unlock()
 
 	r.closed = true
+	// Drop lapsed entries first: Release on a lease we no longer hold is a no-op, but against a
+	// durable coordinator it is still a round-trip, and the shutdown path is where the timeout is
+	// tightest.
+	r.pruneOwnedLocked(r.now())
 	var errs []error
 	for roomID := range r.owned {
 		if err := r.releaseLocked(ctx, roomID); err != nil {
@@ -299,16 +408,41 @@ func (r *Runtime) releaseLocked(ctx context.Context, roomID string) error {
 	delete(r.rooms, roomID)
 	delete(r.owned, roomID)
 	if err != nil {
-		return fmt.Errorf("coord release %q: %w", roomID, err)
+		return fmt.Errorf("%w: release %q: %w", ErrCoordUnavailable, roomID, err)
 	}
 	return nil
+}
+
+// holdsLocked reports whether this node holds a LIVE lease on the room. A lapsed entry is not
+// ownership: the room is free for anyone, including a draining node that must not take it back.
+// Caller must hold r.mu.
+func (r *Runtime) holdsLocked(roomID string, now time.Time) bool {
+	expiry, ok := r.owned[roomID]
+	return ok && now.Before(expiry)
+}
+
+// pruneOwnedLocked drops rooms whose lease has lapsed and returns how many remain — the count of
+// rooms this node ACTUALLY owns right now, which is what a capacity cap has to be measured against.
+//
+// Pruning here rather than on a timer is deliberate: it runs only on the admission path, and only
+// when a cap is configured, so a node without WithMaxRooms pays nothing. A lapsed lease needs no
+// Release either, so dropping the entry loses nothing Shutdown would have done.
+// Caller must hold r.mu.
+func (r *Runtime) pruneOwnedLocked(now time.Time) int {
+	for roomID, expiry := range r.owned {
+		if !now.Before(expiry) {
+			delete(r.owned, roomID)
+		}
+	}
+	return len(r.owned)
 }
 
 // acquire confirms this node holds the room's ownership lease, claiming it if the room is free
 // or expired and renewing it if already held. On failure another node is the live owner: the
 // stale in-memory room is dropped and ErrNotOwner returned. Caller must hold r.mu.
 //
-// The granted Lease (and its fencing Token) is intentionally discarded: in Phase 1 the only
+// The granted Lease's EXPIRY is recorded in owned (a capacity cap has to count live leases, not
+// rooms ever touched). Its fencing Token is still intentionally discarded: in Phase 1 the only
 // thing fenced is the durable write, and that is fenced by the room_seq conditional Append, not
 // the token — so the token is not load-bearing here. The token's eventual job is fencing the
 // one durable write NOT conditioned on room_seq, logstore.WriteSnapshot (today an unconditional
@@ -320,20 +454,33 @@ func (r *Runtime) acquire(ctx context.Context, roomID string) error {
 	if r.closed {
 		return ErrNotOwner
 	}
-	_, ok, err := r.coord.Claim(ctx, roomID, r.nodeID, r.addr, r.now(), r.ttl)
+	// Admission gates apply only to rooms this node does not already hold. Serving an owned room is
+	// never refused: draining hands rooms over one at a time (a blanket refusal would cut every live
+	// session the moment preStop fired), and a capacity cap declines new work rather than evicting
+	// existing work.
+	now := r.now()
+	if !r.holdsLocked(roomID, now) {
+		if r.draining {
+			return ErrDraining
+		}
+		if r.maxRooms > 0 && r.pruneOwnedLocked(now) >= r.maxRooms {
+			return ErrAtCapacity
+		}
+	}
+	lease, ok, err := r.coord.Claim(ctx, roomID, r.nodeID, r.addr, now, r.ttl)
 	if err != nil {
 		// The store did not answer, so we do NOT know we lost the room. Keep the materialized copy
 		// and surface the failure as itself: returning ErrNotOwner here would tell the gateway to
 		// go find the "real" owner, turning a coord brownout into a re-home storm aimed at the
 		// store that is already failing. Ambiguity freezes.
-		return fmt.Errorf("coord claim %q: %w", roomID, err)
+		return fmt.Errorf("%w: claim %q: %w", ErrCoordUnavailable, roomID, err)
 	}
 	if !ok {
 		delete(r.rooms, roomID) // we no longer own it; don't serve from a stale copy
 		delete(r.owned, roomID)
 		return ErrNotOwner
 	}
-	r.owned[roomID] = struct{}{}
+	r.owned[roomID] = lease.Expiry
 	return nil
 }
 

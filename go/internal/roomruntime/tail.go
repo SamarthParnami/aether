@@ -54,7 +54,32 @@ func (r *Runtime) Tail(
 	defer sub.Cancel()
 
 	// A poll tick re-reads the log even with no wake, bounding read staleness if this node isn't
-	// the one being woken (a re-home moved commits to another node's fan-out).
+	// the one being woken (a re-home moved commits to another node's fan-out). It also RENEWS the
+	// lease (see the tick branch below).
+	//
+	// NOT SIM-DRIVABLE, and this is the one timer in the package that isn't. WithClock injects
+	// r.now, which time.NewTicker does not consult, so the DST harness cannot drive this loop —
+	// which now matters more than it used to, because the renewal below decides whether a room held
+	// only by readers keeps its lease. Every test of that has to sleep through real intervals, and
+	// sleep-based timing tests go intermittent on a loaded box, where the natural response is to
+	// raise the sleep rather than to notice the seam is missing.
+	//
+	// Deliberately not fixed here: the queued per-room renewal loop moves renewal OFF this tick
+	// entirely, so the timer that needs to be injectable is that loop's, not this one. Doing it now
+	// would build the seam around a caller about to move.
+	//
+	// When it does land, the seam must NOT be func(time.Duration) *time.Ticker. A fake has to
+	// construct &time.Ticker{C: ch}, i.e. outside NewTicker, and on go1.26 that accepts Stop but
+	// PANICS on Reset ("time: Reset called on uninitialized Ticker") — which this loop calls on
+	// every fan-out wake, just below. So such a fake survives construction and teardown and then
+	// dies on the first commit into the room, which is worse than having no seam. Pass a channel
+	// plus a stop func instead.
+	//
+	// Note how narrow the failing case is, because it is what makes it hard to attribute: the wake
+	// comes from THIS node's fan-out, so the panic needs a room committed to HERE. A room being read
+	// here while it is written on another node never wakes, never calls Reset, and never fails — so
+	// a re-homed room would survive such a fake entirely, and it would only surface once writes came
+	// home.
 	ticker := time.NewTicker(r.tailPoll)
 	defer ticker.Stop()
 
@@ -80,7 +105,51 @@ func (r *Runtime) Tail(
 			// (wake-fed) stream does ~zero empty log reads. Only this goroutine touches the ticker.
 			ticker.Reset(r.tailPoll)
 		case <-ticker.C:
-			// poll fallback — pick up another node's writes (after a re-home) or any missed wake
+			// Poll fallback — pick up another node's writes (after a re-home) or any missed wake —
+			// and RENEW, because reading is serving too.
+			//
+			// Ownership is claim-on-serve and only the write paths were serving, so a room with
+			// readers and no writers — a class where everyone is subscribed and nobody is
+			// committing — lost its lease after one TTL while this node went on streaming it.
+			// Lease liveness and "is this node serving the room" had drifted apart, which is what
+			// made WithMaxRooms under-count: rooms held and streamed, but invisible to a gate that
+			// counts live leases.
+			//
+			// This is why tailPoll must stay comfortably under the lease TTL — the renewal interval
+			// IS the poll interval, so a poll longer than the TTL lets an actively-read room lapse
+			// between ticks and be re-admitted through the capacity gate.
+			//
+			// The renewal is BEST-EFFORT and never fatal to the stream. Every failure mode is a
+			// reason to keep serving, not to stop:
+			//
+			//   - ErrNotOwner: a placement loser's watchers keep reading CORRECTLY, because Tail
+			//     reads events from the shared log and never from fan-out, so the loser converges
+			//     on the winner's commits within one poll tick. TestTailPollSurvivesReHome pins
+			//     exactly that. (There is an argument for the opposite — a per-tick ownership check
+			//     that stops a loser serving a lagging read path — but it would reverse a tested
+			//     guarantee, so it wants deciding on its own, not as a side effect of a capacity
+			//     fix. See Runtime.Shutdown, where the same tension is recorded.)
+			//   - ErrCoordUnavailable: not knowing whether we still hold the lease is not evidence
+			//     that we do not, exactly as acquire itself refuses to render an unanswered claim as
+			//     ErrNotOwner. Returning here would let a store blip shorter than one poll interval
+			//     disconnect every reader on the node at once — ambiguity must freeze, not drop.
+			//   - ErrDraining / ErrAtCapacity: these gate ADMISSION. Letting them reach an
+			//     established stream is precisely the "cut every live session the instant preStop
+			//     fired" that gating admission-only exists to prevent.
+			//
+			// So the tick renews when it can and is silent when it cannot. Reads stay correct
+			// regardless, because they come from the shared log rather than from ownership.
+			//
+			// TODO(observability): a renewal that never succeeds — coord down, or the room
+			// permanently refused — silently returns this node to under-counting its own capacity,
+			// which is the defect this renewal was added to fix, with no signal. The package has no
+			// logger or metrics yet, so there is nowhere to put it; when observability lands this
+			// wants a counter. Same shape as membership's note that a durable View should
+			// distinguish "no rows" from "rows, all expired": both are conditions whose only
+			// symptom is a graph that stopped moving.
+			r.mu.Lock()
+			_ = r.acquire(ctx, roomID)
+			r.mu.Unlock()
 		}
 	}
 }
