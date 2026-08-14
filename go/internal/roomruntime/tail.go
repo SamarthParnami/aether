@@ -114,6 +114,14 @@ func (r *Runtime) Tail(
 			//
 			// So the tick renews when it can and is silent when it cannot. Reads stay correct
 			// regardless, because they come from the shared log rather than from ownership.
+			//
+			// TODO(observability): a renewal that never succeeds — coord down, or the room
+			// permanently refused — silently returns this node to under-counting its own capacity,
+			// which is the defect this renewal was added to fix, with no signal. The package has no
+			// logger or metrics yet, so there is nowhere to put it; when observability lands this
+			// wants a counter. Same shape as membership's note that a durable View should
+			// distinguish "no rows" from "rows, all expired": both are conditions whose only
+			// symptom is a graph that stopped moving.
 			r.mu.Lock()
 			_ = r.acquire(ctx, roomID)
 			r.mu.Unlock()

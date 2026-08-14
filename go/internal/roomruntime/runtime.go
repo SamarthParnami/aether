@@ -337,9 +337,24 @@ func (r *Runtime) Release(ctx context.Context, roomID string) error {
 //
 // SCOPE: this releases leases. It does NOT tear down in-flight Tail/Subscribe streams — those end
 // when the RPC server's context is cancelled (http.Server.Shutdown), which is the binary's job and
-// lands with cmd/. A gateway whose stream outlives the release keeps reading an owner that no
-// longer owns the room until the stream dies, so the two must be sequenced together at the call
-// site: stop the RPC server, then Shutdown the runtime.
+// lands with cmd/.
+//
+// UNRESOLVED, and P9 must settle it rather than inherit it. The note here used to say the two are
+// sequenced "stop the RPC server, then Shutdown the runtime", on the grounds that a stream
+// outliving the release keeps reading from a node that no longer owns the room. That justification
+// now contradicts the one Tail's renewal relies on: §4.2 explicitly permits a reader to outlive the
+// release, because reads come from the shared log and stay correct. Both orderings have a cost:
+//
+//   - server first: leases are still held when the server stops, so every disconnected gateway
+//     re-resolves onto a directory still naming this pod, dials a dead address and backs off until
+//     Release lands or the TTL lapses — a reconnect storm aimed at a node that is already gone;
+//   - release first: gateways that re-resolve land on a live new owner, and existing readers keep
+//     working off the shared log until the pod actually dies.
+//
+// Either way nothing ends reader streams DURING the drain, so they all disconnect at once when the
+// process exits — a synchronised reconnect for every reader on the node, which is the shape of
+// event a drain exists to avoid. Staggering it needs something to cancel per-room stream contexts
+// once ownership has moved, which Runtime does not track today.
 // Every room is attempted even if one release fails; the failures are joined and returned, so a
 // single unreachable-store room cannot strand the rest of the node's leases.
 //
