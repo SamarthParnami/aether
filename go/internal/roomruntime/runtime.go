@@ -39,10 +39,12 @@ import (
 // comfortably larger than the renewal interval (defaultTailPollInterval, which is what renews a
 // read-held room) and the max inter-node clock skew.
 //
-// 01-design-backbone.md §6.4 specifies "renew ~2s, expire ~6s". These are 3s/10s: the same
-// renew-to-expiry ratio, shifted up, which buys more headroom against GC pauses and skew at the
-// cost of a slower failover floor. Noted because §6.4's numbers are the ones a reader will check
-// this constraint against and they will not match.
+// 01-design-backbone.md §6.4 specifies "renew ~2s, expire ~6s"; these are 3s/10s. The trade is a
+// slower failover floor bought for DOUBLE THE ABSOLUTE SLACK after a missed renewal — TTL minus two
+// renewal intervals is 4s here against §6.4's 2s — which is what matters, because GC pauses and
+// clock skew consume absolute time, not a fraction of the TTL. (The renew-to-expiry ratio is
+// incidentally slightly lower, 0.30 against 0.33; it is not the quantity doing the work.) Noted
+// because §6.4's numbers are the ones a reader will check this constraint against.
 const defaultLeaseTTL = 10 * time.Second
 
 // defaultTailPollInterval is the coarse backstop at which Tail re-reads the durable log even with
