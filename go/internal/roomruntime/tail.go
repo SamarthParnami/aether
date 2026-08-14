@@ -66,10 +66,14 @@ func (r *Runtime) Tail(
 	//
 	// Deliberately not fixed here: the queued per-room renewal loop moves renewal OFF this tick
 	// entirely, so the timer that needs to be injectable is that loop's, not this one. Doing it now
-	// would build the seam around a caller about to move. (A seam does work: an injected
-	// func(time.Duration) *time.Ticker fakes fine, since &time.Ticker{C: ch} accepts Stop on
-	// go1.26 — though that constructs a Ticker outside NewTicker, which the docs do not promise, so
-	// a channel-plus-stop-func signature is the safer shape.)
+	// would build the seam around a caller about to move.
+	//
+	// When it does land, the seam must NOT be func(time.Duration) *time.Ticker. A fake has to
+	// construct &time.Ticker{C: ch}, i.e. outside NewTicker, and on go1.26 that accepts Stop but
+	// PANICS on Reset ("time: Reset called on uninitialized Ticker") — which this loop calls on
+	// every fan-out wake, just below. So such a fake survives construction and teardown and then
+	// dies on the first commit into the room: broken on every active room, fine on every quiet one,
+	// which is worse than having no seam. Pass a channel plus a stop func instead.
 	ticker := time.NewTicker(r.tailPoll)
 	defer ticker.Stop()
 
