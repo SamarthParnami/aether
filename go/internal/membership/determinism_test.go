@@ -17,11 +17,18 @@ import (
 // the same "passes only by accident of size" this PR diagnosed one round earlier, reproduced in its
 // own replacement at a different constant.
 //
-// Running both orders removes size from the answer: a total order over (ID, Addr) yields the lowest
-// Addr either way, while any ID-only sort — stable or not — must disagree with itself on at least
-// one of the two. It also guards the likeliest future regression, which is not someone
-// reintroducing a stable sort but someone simplifying the comparator back to a one-line
-// strings.Compare(a.ID, b.ID).
+// Running both orders removes size from the answer FOR AN ABSOLUTE ASSERTION: a total order over
+// (ID, Addr) yields the lowest Addr either way, while any ID-only sort must fail to produce it in at
+// least one of the two, whatever the fleet size.
+//
+// It does NOT rescue a self-consistency check. Comparing NewView(forward) against NewView(reversed)
+// only fails when those two permutations happen to disagree, and running that twice is still a
+// self-consistency check — both orders can coincidentally agree while both are wrong. So the
+// permutation comparisons below are ANCHORED to dupLo.Addr as well; without the anchor they slip
+// past the original defect at 160 of 188 fleet sizes, n=64 among them.
+//
+// Together they guard the likeliest future regression, which is not someone reintroducing a stable
+// sort but someone simplifying the comparator back to a one-line strings.Compare(a.ID, b.ID).
 var (
 	dupHi = membership.Node{ID: "dup", Addr: "10.0.0.9:7001"}
 	dupLo = membership.Node{ID: "dup", Addr: "10.0.0.1:7001"}
@@ -30,6 +37,16 @@ var (
 // dupOrders is the duplicate pair both ways round.
 func dupOrders() [][]membership.Node {
 	return [][]membership.Node{{dupHi, dupLo}, {dupLo, dupHi}}
+}
+
+// dupAddr returns the Addr the view kept for the duplicate id.
+func dupAddr(nodes []membership.Node) string {
+	for _, n := range nodes {
+		if n.ID == "dup" {
+			return n.Addr
+		}
+	}
+	return ""
 }
 
 // buildFleet returns n filler nodes in DESCENDING id order (so the input is far from sorted and
@@ -89,6 +106,15 @@ func TestNewViewIsIndependentOfInputOrder(t *testing.T) {
 			t.Errorf("input order [%s %s]: view depends on input order:\n forward  = %v\n reversed = %v",
 				dup[0].Addr, dup[1].Addr, a, b)
 		}
+		// Anchor both sides to the expected value. Agreement alone is a SELF-CONSISTENCY check, and
+		// two permutations can coincidentally agree while both being wrong — which is how an ID-only
+		// sort slips past this at most fleet sizes. The anchor is what makes it size-independent.
+		for label, got := range map[string]string{"forward": dupAddr(a), "reversed": dupAddr(b)} {
+			if got != dupLo.Addr {
+				t.Errorf("input order [%s %s], %s view: duplicate kept %q, want %q",
+					dup[0].Addr, dup[1].Addr, label, got, dupLo.Addr)
+			}
+		}
 	}
 }
 
@@ -108,6 +134,14 @@ func TestRankAgreesOnAddrAcrossInputOrders(t *testing.T) {
 			if fmt.Sprint(a) != fmt.Sprint(b) {
 				t.Errorf("input order [%s %s]: Rank(%q) differs:\n forward  = %v\n reversed = %v",
 					dup[0].Addr, dup[1].Addr, room, a, b)
+			}
+			// Anchored for the same reason as above: two rankings agreeing on a wrong address is
+			// still two gateways dialling the wrong process in unison.
+			for label, got := range map[string]string{"forward": dupAddr(a), "reversed": dupAddr(b)} {
+				if got != dupLo.Addr {
+					t.Errorf("input order [%s %s], %s Rank(%q): duplicate ranked with %q, want %q",
+						dup[0].Addr, dup[1].Addr, label, room, got, dupLo.Addr)
+				}
 			}
 		}
 	}
