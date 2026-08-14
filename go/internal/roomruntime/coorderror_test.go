@@ -178,6 +178,30 @@ func TestShutdownWithACancelledContextStrandsEveryLease(t *testing.T) {
 	}
 }
 
+// The same trap on the DEFAULT coordinator — no coordtest.Faulty, no options, exactly what
+// roomruntime.New() gives you and what twoNodes() uses.
+//
+// This is the test that makes the guard structural rather than opt-in. The version above only
+// fires for someone who already reached for Faulty, and knowing to reach for it requires already
+// suspecting the bug — which is the "remembering" the guard was supposed to remove. Whoever writes
+// P9's preStop test gets the default coordinator, so the default coordinator is where this has to
+// bite.
+func TestShutdownWithACancelledContextFailsOnTheDefaultCoordinator(t *testing.T) {
+	rt := roomruntime.New(logstore.NewMemory(), fanout.NewMemory())
+	if _, applied, err := rt.Commit(context.Background(), "room", "x", 1, kvBody("k", "v")); err != nil || !applied {
+		t.Fatalf("commit: applied=%v err=%v", applied, err)
+	}
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := rt.Shutdown(cancelled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Shutdown on the default coordinator = %v, want it to wrap context.Canceled — "+
+			"the default path is still blind to a dead context, so the trap only shows up for "+
+			"someone who already suspected it", err)
+	}
+}
+
 // perRoomFaultyRelease fails Release for chosen rooms and records every room it was asked to
 // release — enough to tell "never attempted" apart from "attempted and failed", which is the whole
 // question when one room's failure could abort the loop.
