@@ -2,6 +2,7 @@ package roomruntime
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	aetherv1 "github.com/SamarthParnami/aether/go/gen/aether/v1"
@@ -54,7 +55,8 @@ func (r *Runtime) Tail(
 	defer sub.Cancel()
 
 	// A poll tick re-reads the log even with no wake, bounding read staleness if this node isn't
-	// the one being woken (a re-home moved commits to another node's fan-out).
+	// the one being woken (a re-home moved commits to another node's fan-out). It also RE-ACQUIRES
+	// (see the tick branch below).
 	ticker := time.NewTicker(r.tailPoll)
 	defer ticker.Stop()
 
@@ -80,7 +82,34 @@ func (r *Runtime) Tail(
 			// (wake-fed) stream does ~zero empty log reads. Only this goroutine touches the ticker.
 			ticker.Reset(r.tailPoll)
 		case <-ticker.C:
-			// poll fallback — pick up another node's writes (after a re-home) or any missed wake
+			// Poll fallback — pick up another node's writes (after a re-home) or any missed wake —
+			// and RENEW, because reading is serving too.
+			//
+			// Ownership is claim-on-serve and only the write paths were serving, so a room with
+			// readers and no writers — a class where everyone is subscribed and nobody is
+			// committing — lost its lease after one TTL while this node went on streaming it.
+			// Lease liveness and "is this node serving the room" had drifted apart, which is what
+			// made WithMaxRooms under-count: rooms held and streamed, but invisible to a gate that
+			// counts live leases.
+			//
+			// This is why tailPoll must stay comfortably under the lease TTL — the renewal interval
+			// IS the poll interval, so a poll longer than the TTL lets an actively-read room lapse
+			// between ticks and be re-admitted through the capacity gate.
+			//
+			// ErrNotOwner is deliberately IGNORED rather than returned. 01-design-backbone/§4.2
+			// specifies that a placement loser's watchers keep reading correctly from the shared
+			// log and converge on the winner's commits within one tick, and
+			// TestTailPollSurvivesReHome pins exactly that. Returning here would reverse it.
+			// 07-design-placement.md §10 does want a per-tick ownership check that stops a loser
+			// serving a lagging read path — but that contradicts §4.2, it is listed there as owed
+			// and NOT scheduled, and reversing a documented, tested read guarantee is not something
+			// to do as a side effect of a capacity fix.
+			r.mu.Lock()
+			err := r.acquire(ctx, roomID)
+			r.mu.Unlock()
+			if err != nil && !errors.Is(err, ErrNotOwner) {
+				return err
+			}
 		}
 	}
 }

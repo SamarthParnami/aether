@@ -289,3 +289,42 @@ func TestDrainingRefusesARoomWhoseLeaseLapsed(t *testing.T) {
 			"is not ownership, so the admission gate must apply", err)
 	}
 }
+
+// The cap must see rooms that are being READ, not only rooms being written.
+//
+// Ownership was claim-on-serve for writes alone, so a room with readers and no writers — a class
+// where everyone is subscribed and nobody is committing — lost its lease after one TTL while the
+// node kept streaming it. Counting live leases then UNDER-counts, which is quieter and worse than
+// the lifetime over-count it replaced: instead of a node that refuses everything (visible, and
+// traceable in a day), a node that accepts everything and dies of memory pressure with no
+// connection to the knob meant to prevent it.
+func TestMaxRoomsCountsRoomsHeldByReadersAlone(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	co := coord.NewMemory()
+	rt := roomruntime.New(logstore.NewMemory(), fanout.NewMemory(),
+		roomruntime.WithNodeID("A"),
+		roomruntime.WithAddr("a.example:7001"),
+		roomruntime.WithCoordinator(co),
+		roomruntime.WithLeaseTTL(200*time.Millisecond),
+		roomruntime.WithTailPollInterval(20*time.Millisecond), // renewal interval, well under the TTL
+		roomruntime.WithMaxRooms(2),
+	)
+
+	// Two rooms held by readers only — no commits after the seed, so nothing but Tail renews them.
+	for _, room := range []string{"room-1", "room-2"} {
+		if _, applied, err := rt.Commit(ctx, room, "x", 1, kvBody("k", "v")); err != nil || !applied {
+			t.Fatalf("%s seed commit: applied=%v err=%v", room, applied, err)
+		}
+		go func() { _ = rt.Tail(ctx, room, 0, func(*aetherv1.Event) error { return nil }) }()
+	}
+
+	// Outlive the lease several times over. Only the readers keep these rooms alive.
+	time.Sleep(600 * time.Millisecond)
+
+	if _, _, err := rt.Commit(ctx, "room-3", "x", 1, kvBody("k", "v")); !errors.Is(err, roomruntime.ErrAtCapacity) {
+		t.Fatalf("third room while two are held by readers = %v, want ErrAtCapacity — the cap "+
+			"cannot see rooms this node is streaming, so it does not bound what the node holds", err)
+	}
+}

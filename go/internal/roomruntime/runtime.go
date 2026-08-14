@@ -357,6 +357,10 @@ func (r *Runtime) Shutdown(ctx context.Context) error {
 	defer r.mu.Unlock()
 
 	r.closed = true
+	// Drop lapsed entries first: Release on a lease we no longer hold is a no-op, but against a
+	// durable coordinator it is still a round-trip, and the shutdown path is where the timeout is
+	// tightest.
+	r.pruneOwnedLocked(r.now())
 	var errs []error
 	for roomID := range r.owned {
 		if err := r.releaseLocked(ctx, roomID); err != nil {
