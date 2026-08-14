@@ -183,7 +183,11 @@ func runFailoverScenario(t *testing.T, seed int64) chaosCounts {
 		now := s.Now()
 
 		var target string
-		if cur, ok := co.Current(room, now); ok {
+		cur, ok, err := co.Current(ctx, room, now)
+		if err != nil {
+			t.Fatalf("coord.Current: unexpected error: %v", err)
+		}
+		if ok {
 			if alive[cur.Owner] {
 				target = cur.Owner
 			} else {

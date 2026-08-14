@@ -9,6 +9,22 @@ import (
 	"github.com/SamarthParnami/aether/go/internal/roomruntime"
 )
 
+// shutdown asserts the graceful path actually completed. Shutdown now reports the releases it
+// could not land, and a test that discarded that would keep passing while every lease leaked —
+// the exact failure Shutdown exists to prevent.
+//
+// Deliberately context.Background() and NOT t.Context(): t.Context() is cancelled just before
+// Cleanup functions run, and this helper is exactly the shape one registers in t.Cleanup. Against a
+// ctx-aware coordinator that combination makes every release fail — a silent no-op that still
+// passes, since the rooms are dropped locally either way. The production trap is the same shape
+// (see Runtime.Shutdown).
+func shutdown(t *testing.T, rt *roomruntime.Runtime) {
+	t.Helper()
+	if err := rt.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+}
+
 // The point of Shutdown: a survivor takes over with NO time passing. The clock is never advanced
 // in this test, so if the assertion holds it can only be because the lease was handed back —
 // not because it lapsed. That is the difference between an instant handover and a TTL-long hole
@@ -24,7 +40,7 @@ func TestShutdownHandsRoomsOverWithoutWaitingOutTheTTL(t *testing.T) {
 		t.Fatalf("B must be locked out while A holds the lease, got %v", err)
 	}
 
-	a.Shutdown()
+	shutdown(t, a)
 
 	if _, err := b.Join(ctx, "room"); err != nil {
 		t.Fatalf("B must take over immediately after A shuts down, got %v", err)
@@ -43,7 +59,7 @@ func TestShutdownReleasesEveryOwnedRoom(t *testing.T) {
 		}
 	}
 
-	a.Shutdown()
+	shutdown(t, a)
 
 	for _, room := range rooms {
 		if _, err := b.Join(ctx, room); err != nil {
@@ -62,7 +78,7 @@ func TestShutdownRuntimeNeverReclaims(t *testing.T) {
 	if _, applied, err := a.Commit(ctx, "room", "x", 1, kvBody("k", "v")); err != nil || !applied {
 		t.Fatalf("A must own the room first: applied=%v err=%v", applied, err)
 	}
-	a.Shutdown()
+	shutdown(t, a)
 
 	// A late request to the departing node must not resurrect its ownership…
 	if _, _, err := a.Commit(ctx, "room", "x", 2, kvBody("k", "v2")); !errors.Is(err, roomruntime.ErrNotOwner) {
@@ -87,8 +103,8 @@ func TestShutdownIsIdempotent(t *testing.T) {
 		t.Fatalf("A must own the room first: applied=%v err=%v", applied, err)
 	}
 
-	a.Shutdown()
-	a.Shutdown()
+	shutdown(t, a)
+	shutdown(t, a)
 
 	if _, err := b.Join(ctx, "room"); err != nil {
 		t.Fatalf("B must own the room after a repeated shutdown, got %v", err)
@@ -112,7 +128,7 @@ func TestShutdownDoesNotRevokeALeaseAlreadyTakenOver(t *testing.T) {
 	}
 
 	// A now shuts down and tries to release a room it no longer owns. B must be unaffected.
-	a.Shutdown()
+	shutdown(t, a)
 
 	if _, applied, err := b.Commit(ctx, "room", "y", 1, kvBody("k", "v2")); err != nil || !applied {
 		t.Fatalf("B must still own the room after A's late shutdown: applied=%v err=%v", applied, err)

@@ -20,7 +20,10 @@
 // clock; only the expiry comparisons here use these wall-clock instants.
 package coord
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 // Lease is a time-bound ownership token for a room.
 type Lease struct {
@@ -31,6 +34,49 @@ type Lease struct {
 }
 
 // Coordinator manages room ownership and answers the directory lookup.
+//
+// Every method takes a ctx and returns an error, and the bool and the error are INDEPENDENT: the
+// bool is what the store said (held / not held), the error is that the store did not answer at
+// all. A durable adapter must never fold the second into the first — a DynamoDB throttle or a
+// timeout rendered as "not held" is indistinguishable from "this room is unowned", and routing
+// reads "unowned" as an invitation to place the room somewhere. That would aim a claim storm at a
+// store already failing. Callers check err FIRST and freeze on ambiguity; only a nil error makes
+// the bool meaningful.
+//
+// The principle is 01-design-backbone.md §6.4's lease fail-safe — "ambiguity → freeze, never assume
+// ownership" — though note §6.4 scopes it to refusing WRITES. Extending it to routing (an
+// unanswered directory read must not be rendered as "unowned", because that reads as permission to
+// place) is this layer's own conclusion, not something §6.4 states.
+//
+// # Two requirements on any durable implementation
+//
+// 1. BOUND EVERY CALL, well under the lease TTL. Not a suggestion: roomruntime.acquire calls Claim
+// as the first thing inside the Runtime-wide mutex, on the Join, Commit, Tail, TailEphemeral and
+// Broadcast paths. That lock is a documented Phase-1 simplification accepted for logstore.Append,
+// which fails fast and is conditional per room — a coord brownout is the opposite: slow, node-wide,
+// and correlated across every room at once. An unbounded retry budget inside that lock converts a
+// store brownout into a full node stall, and this layer's whole thesis is that ambiguity should
+// freeze rather than storm — which assumes the node can still answer in order to say "frozen".
+// Convoyed behind one mutex it cannot. The timeout belongs to the implementation; the requirement
+// belongs here, where the interface is set.
+//
+// 2. HONOUR ctx. A cancelled context must produce an error, never a silent success. Memory checks
+// ctx for this reason even though an in-memory map cannot block: a cancelled context means the
+// caller has given up however fast the answer would have been, and a fake that ignored it would
+// leave the suite blind to callers passing an already-dead context.
+//
+// 3. The Expiry that CLAIM AND RENEW return is the caller's clock plus the requested ttl — never a
+// server-side timestamp. A claimant compares it against its own now to decide whether it still
+// holds a room, so an expiry minted from the store's clock would skew that comparison by the full
+// inter-node offset. Computing it server-side is the more natural thing to write in a DynamoDB
+// adapter, and Memory's now.Add(ttl) makes the coupling invisible until then.
+//
+// CURRENT is different, and the distinction matters: it returns the STORED lease, whose Expiry was
+// minted by whichever node claimed the room, from that node's clock. It is not comparable against
+// the reader's clock beyond the liveness check Current has already applied — "how long until this
+// lease lapses" is a natural question for a gateway to ask and is only answerable to within the
+// full inter-node skew. That is safe as a liveness test (see the package doc: skew widens the
+// failover window, it does not break the hard guard) and unsafe as arithmetic.
 type Coordinator interface {
 	// Claim attempts to acquire roomID for owner, publishing owner's dialable RPC address (addr)
 	// atomically with the claim — so the directory never names an owner the gateway can't reach
@@ -38,18 +84,29 @@ type Coordinator interface {
 	// has expired, or owner already holds it. A takeover (acquiring a free/expired lease) bumps the
 	// fencing token; a re-claim by the current holder keeps it and re-affirms addr. Returns the
 	// granted lease and true, or a zero lease and false when another node holds an unexpired lease.
-	Claim(roomID, owner, addr string, now time.Time, ttl time.Duration) (Lease, bool)
+	// A non-nil error means the claim's outcome is UNKNOWN — the caller has not lost the room and
+	// must not drop it; it must not treat the false as "another node owns this".
+	Claim(ctx context.Context, roomID, owner, addr string, now time.Time, ttl time.Duration) (Lease, bool, error)
 
 	// Renew extends owner's lease. Returns false (ownership lost) if owner is not the
 	// current unexpired holder.
-	Renew(roomID, owner string, now time.Time, ttl time.Duration) (Lease, bool)
+	//
+	// RESERVED — it has no production call site and is not expected to gain one. Ownership is
+	// renewed by claim-on-serve (Claim is idempotent for the current holder and re-affirms addr),
+	// so a reader should not assume a renew path exists. It is kept for a future background
+	// renewal loop that pins quiet rooms; such a loop would still re-Claim if it needs to update
+	// addr (see Memory.Renew).
+	Renew(ctx context.Context, roomID, owner string, now time.Time, ttl time.Duration) (Lease, bool, error)
 
 	// Release relinquishes ownership if owner holds it — a graceful handoff on shutdown,
-	// so a survivor can claim immediately instead of waiting out the TTL.
-	Release(roomID, owner string)
+	// so a survivor can claim immediately instead of waiting out the TTL. An error means the
+	// release may not have landed: the lease then lapses on its own TTL, which is the slow path
+	// Release exists to avoid, so callers should surface it rather than discard it.
+	Release(ctx context.Context, roomID, owner string) error
 
 	// Current returns the unexpired lease for a room: the directory lookup gateways use to
 	// route, including the owner's Addr. Returns false if the room is unowned or its lease has
-	// lapsed.
-	Current(roomID string, now time.Time) (Lease, bool)
+	// lapsed. A non-nil error means the directory could not be read — NOT that the room is
+	// unowned. This is the distinction the whole interface change exists to make.
+	Current(ctx context.Context, roomID string, now time.Time) (Lease, bool, error)
 }

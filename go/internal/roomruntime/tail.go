@@ -35,7 +35,7 @@ func (r *Runtime) Tail(
 	ctx context.Context, roomID string, fromSeq uint64, send func(*aetherv1.Event) error,
 ) error {
 	r.mu.Lock()
-	err := r.acquire(roomID)
+	err := r.acquire(ctx, roomID)
 	r.mu.Unlock()
 	if err != nil {
 		return err

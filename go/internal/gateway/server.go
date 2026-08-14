@@ -277,7 +277,7 @@ func (c *conn) handleJoin(ctx context.Context, join *aetherv1.Join) {
 	}
 
 	room := join.GetRoomId()
-	owner, _, err := c.srv.locator.Owner(room)
+	owner, _, err := c.srv.locator.Owner(ctx, room)
 	if err != nil {
 		c.send(errorFrame("UNAVAILABLE", "room has no reachable owner"))
 		return
@@ -347,7 +347,7 @@ func (c *conn) relay(ctx context.Context, roomID string, fromSeq uint64) {
 		if ctx.Err() != nil {
 			return
 		}
-		owner, addr, err := c.srv.locator.Owner(roomID)
+		owner, addr, err := c.srv.locator.Owner(ctx, roomID)
 		if err != nil {
 			// No reachable owner right now (lease lapsed / mid re-home) — freeze and retry.
 			c.freeze(ctx, roomID, &frozen)
@@ -508,7 +508,7 @@ func (c *conn) handleCommit(ctx context.Context, commit *aetherv1.Commit) {
 	// UNAVAILABLE reason — not an uncorrelated Error — so the SDK can tell a re-home blip apart from a
 	// permanent rejection and buffer + resubmit this commit when the room's relay signals LIVE again.
 	// The write-side mirror of the relay's read-side FROZEN/LIVE recovery.
-	owner, addr, err := c.srv.locator.Owner(room)
+	owner, addr, err := c.srv.locator.Owner(ctx, room)
 	if err != nil {
 		c.send(nackFrame(room, commit.GetClientSeq(), aetherv1.NackReason_NACK_REASON_UNAVAILABLE))
 		return
@@ -543,7 +543,7 @@ func (c *conn) handleBroadcast(ctx context.Context, b *aetherv1.Broadcast) {
 		return
 	}
 
-	owner, addr, err := c.srv.locator.Owner(room)
+	owner, addr, err := c.srv.locator.Owner(ctx, room)
 	if err != nil {
 		return // no reachable owner — drop the ephemeral (best-effort)
 	}
